@@ -1,0 +1,21 @@
+esphome:
+  name: presto-example
+  platformio_options:
+    board_build.flash_size: 16777216
+    board_upload.maximum_size: 16777216
+rp2:
+  board: pimoroni_pico_plus_2w
+  variant: rp2350
+logger:
+external_components:
+  - source:
+      type: local
+      path: ../components
+display:
+  - platform: presto_display
+    id: presto_lcd
+    lambda: |-
+      it.fill(Color(0, 0, 0));
+      it.filled_rectangle(0, 0, 160, 480, Color(255, 0, 0));
+      it.filled_rectangle(160, 0, 160, 480, Color(0, 255, 0));
+      it.filled_rectangle(320, 0, 160, 480, Color(0, 0, 255));

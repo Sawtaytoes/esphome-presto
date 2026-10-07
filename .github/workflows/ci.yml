@@ -1,0 +1,42 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  nativeLint:
+    uses: Sawtaytoes/charcuterie/.github/workflows/shared-native-lint.yml@workflows-v1
+    with:
+      cppExclude: >-
+        components/presto_display/st7701
+        components/presto_display/miniz
+  decoder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m unittest discover -s tests
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [display-test, hardware-test, castkit]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Supply build-only example secrets
+        run: |
+          cat > examples/secrets.yaml <<'EOF'
+          wifi_ssid: example-network
+          wifi_password: example-password
+          api_encryption_key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+          EOF
+      - name: Compile the RP2350 example
+        run: >-
+          docker run --rm -v "$GITHUB_WORKSPACE:/config"
+          ghcr.io/esphome/esphome:2026.9.1
+          compile examples/${{ matrix.example }}.yaml
