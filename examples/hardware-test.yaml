@@ -1,0 +1,49 @@
+esphome:
+  name: presto-example
+  platformio_options:
+    board_build.flash_size: 16777216
+    board_upload.maximum_size: 16777216
+rp2:
+  board: pimoroni_pico_plus_2w
+  variant: rp2350
+logger:
+external_components:
+  - source:
+      type: local
+      path: ../components
+display:
+  - platform: presto_display
+    id: presto_lcd
+    lambda: |-
+      it.fill(Color(0, 0, 0));
+      it.filled_rectangle(0, 0, 160, 480, Color(255, 0, 0));
+      it.filled_rectangle(160, 0, 160, 480, Color(0, 255, 0));
+      it.filled_rectangle(320, 0, 160, 480, Color(0, 0, 255));
+
+i2c:
+  sda: GPIO30
+  scl: GPIO31
+  frequency: 100kHz
+  scan: false
+touchscreen:
+  - platform: ft63x6
+    address: 0x48
+    display: presto_lcd
+    update_interval: 20ms
+    on_touch:
+      - lambda: |-
+          ESP_LOGI("presto_touch", "Touch %d,%d", touch.x, touch.y);
+output:
+  - platform: presto_display
+    id: presto_backlight
+    display_id: presto_lcd
+light:
+  - platform: monochromatic
+    name: LCD Backlight
+    output: presto_backlight
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: presto_display
+    name: Rear LEDs
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
