@@ -1,3 +1,4 @@
+#include "esphome/core/defines.h"
 #ifdef USE_PRESTO_AMBIENT
 #include "presto_ambient.h"
 #include "esphome/core/log.h"
@@ -22,26 +23,32 @@ void PrestoAmbient::setup() {
   pio_sm_set_enabled(pio_, sm_, true);
   send_pixels_();
 }
-void PrestoAmbient::write_state(light::LightState *state) { send_pixels_(); }
+void PrestoAmbient::write_state(light::LightState *state) {
+  send_pixels_();
+}
 void PrestoAmbient::set_pixels(const uint8_t *rgb) {
   memcpy(pixels_.data(), rgb, pixels_.size());
   send_pixels_();
 }
 void PrestoAmbient::send_pixels_() {
   // Wait for the preceding seven pixels and their reset latch to finish.
-  while (uint32_t(micros() - last_write_) < 300) delayMicroseconds(1);
+  while (uint32_t(micros() - last_write_) < 300) {
+    delayMicroseconds(1);
+  }
   for (int i = 0; i < 7; ++i) {
-    const uint32_t grb = (uint32_t(pixels_[i*3+1]) << 24) |
-        (uint32_t(pixels_[i*3]) << 16) | (uint32_t(pixels_[i*3+2]) << 8);
+    const uint32_t grb = (uint32_t(pixels_[i * 3 + 1]) << 24) | (uint32_t(pixels_[i * 3]) << 16) |
+                         (uint32_t(pixels_[i * 3 + 2]) << 8);
     pio_sm_put_blocking(pio_, sm_, grb);
   }
   last_write_ = micros();
 }
 light::ESPColorView PrestoAmbient::get_view_internal(int32_t index) const {
   uint8_t *p = pixels_.data() + index * 3;
-  return {p, p+1, p+2, nullptr, effect_data_.data()+index, &correction_};
+  return {p, p + 1, p + 2, nullptr, effect_data_.data() + index, &correction_};
 }
-void PrestoAmbient::dump_config() { ESP_LOGCONFIG(TAG, "Presto rear LEDs: 7, GPIO33, PIO2"); }
+void PrestoAmbient::dump_config() {
+  ESP_LOGCONFIG(TAG, "Presto rear LEDs: 7, GPIO33, PIO2");
 }
+} // namespace esphome::presto_display
 
 #endif

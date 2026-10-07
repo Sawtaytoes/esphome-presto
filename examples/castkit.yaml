@@ -1,0 +1,106 @@
+esphome:
+  name: presto-castkit
+  friendly_name: Presto Display
+  platformio_options:
+    board_build.flash_size: 16777216
+    board_upload.maximum_size: 16777216
+  on_boot:
+    - priority: -100
+      then:
+        - lambda: id(presto_lcd).set_brightness(0.02f);
+        - lambda: id(presto_remote).set_touch_poller([](){ id(presto_touch).update(); });
+rp2:
+  board: pimoroni_pico_plus_2w
+  variant: rp2350
+logger: null
+external_components:
+  - source:
+      type: local
+      path: ../components
+display:
+  - platform: presto_display
+    id: presto_lcd
+    update_interval: never
+wifi:
+  ssid: !secret 'wifi_ssid'
+  password: !secret 'wifi_password'
+  power_save_mode: none
+api:
+  batch_delay: 0ms
+  encryption:
+    key: !secret 'api_encryption_key'
+  reboot_timeout: 0s
+  actions:
+    - action: frame_chunk
+      variables:
+        frame_id: int
+        touch_id: int
+        format: int
+        offset: int
+        final_chunk: bool
+        image_data: string
+      then:
+        - lambda: id(presto_remote).frame_chunk(frame_id, touch_id, format, offset, final_chunk, image_data);
+    - action: set_display_controls
+      variables:
+        revision: int
+        backlight: int
+        colors: string
+      then:
+        - lambda: |-
+            uint8_t pixels[21];
+            if (backlight < 0 || backlight > 100 || colors.size() != 28 ||
+                esphome::base64_decode(reinterpret_cast<const uint8_t *>(colors.c_str()), colors.size(), pixels, sizeof(pixels)) != 21) return;
+            id(presto_lcd).set_brightness(backlight / 100.0f);
+            id(presto_ambient).set_pixels(pixels);
+            id(presto_remote).controls_ack(revision, backlight);
+ota:
+  - platform: esphome
+    encryption: {}
+    on_begin:
+      - lambda: id(presto_lcd).pause_scanout();
+    on_error:
+      - lambda: App.safe_reboot();
+touchscreen:
+  - platform: presto_display
+    id: presto_touch
+    display: presto_lcd
+    update_interval: 20ms
+    on_touch:
+      - lambda: id(presto_remote).touch(0, touch.x, touch.y);
+    on_update:
+      - lambda: 'for (auto &point : touches) if (point.state == 2) id(presto_remote).touch(1, point.x,
+          point.y);'
+    on_release:
+      - lambda: id(presto_remote).touch(2, 0, 0);
+output:
+  - platform: presto_display
+    id: presto_backlight
+    display_id: presto_lcd
+light:
+  - platform: monochromatic
+    name: Test LCD Backlight
+    id: test_backlight
+    output: presto_backlight
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    gamma_correct: 1.0
+    internal: true
+  - platform: presto_display
+    name: Test Rear LEDs
+    id: test_rear_leds
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    internal: true
+    output_id: presto_ambient
+text_sensor:
+  - platform: template
+    name: Display Events
+    id: display_events
+    update_interval: never
+    entity_category: diagnostic
+    disabled_by_default: true
+presto_display:
+  id: presto_remote
+  display_id: presto_lcd
+  events_id: display_events

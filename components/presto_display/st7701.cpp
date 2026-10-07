@@ -193,16 +193,31 @@ void __not_in_flash_func(ST7701::start_line_xfer)()
 {
     hw_clear_bits(&st_pio->irq, 0x1);
 
-    ++display_row;
-    if (display_row == DISPLAY_HEIGHT) next_line_addr = 0;
+    if (palette) ++display_row;
+    else {
+        const uint bank = scanline_bank.load(std::memory_order_relaxed);
+        display_row = (dma_hw->ch[st_dma2].read_addr -
+                       uintptr_t(scanline_addresses[bank])) / sizeof(uint16_t *);
+    }
+    if (display_row >= DISPLAY_HEIGHT) next_line_addr = 0;
     else if (palette) next_line_addr = &framebuffer[(width >> 1) * (display_row >> row_shift)];
     else {
-        // This line is already ready. Fill two rows ahead, after its previous
-        // occupant has left DMA, rather than competing with the current line.
-        next_line_addr = scanlines[display_row & 3];
-        const int prepare_row = display_row + 2;
-        if (prepare_row < DISPLAY_HEIGHT) {
-            memcpy(scanlines[prepare_row & 3], &framebuffer[width * prepare_row], width * sizeof(uint16_t));
+        const uint8_t bank = scanline_bank.load(std::memory_order_relaxed);
+        next_line_addr = scanlines[bank][display_row & (SCANLINE_COUNT - 1)];
+        // Keep half a cache bank ahead. If DMA is busy, retry the same
+        // batch on the next line; never silently skip a row.
+        const bool busy = dma_channel_is_busy(prefetch_dma);
+        if ((busy && display_row >= prefetch_row - PREFETCH_ROWS) ||
+            (!busy && display_row >= prefetch_row)) ++prefetch_overruns;
+        if (!busy && display_row >= prefetch_row - int(SCANLINE_COUNT / 2)) {
+            const int row = prefetch_row % DISPLAY_HEIGHT;
+            // The paced XIP streaming FIFO avoids direct PSRAM DMA stalls.
+            dma_channel_set_write_addr(prefetch_dma,
+                scanlines[bank][row & (SCANLINE_COUNT - 1)], false);
+            dma_channel_set_trans_count(prefetch_dma, width * PREFETCH_ROWS / 2, true);
+            xip_ctrl_hw->stream_addr = uintptr_t(framebuffer + width * row);
+            xip_ctrl_hw->stream_ctr = width * PREFETCH_ROWS / 2;
+            prefetch_row += PREFETCH_ROWS;
         }
     }
 }
@@ -212,10 +227,19 @@ void __not_in_flash_func(ST7701::start_frame_xfer)()
     hw_clear_bits(&st_pio->irq, 0x2);
 
     if (uint16_t *next = next_framebuffer.exchange(nullptr, std::memory_order_acq_rel)) {
+        if (!palette) {
+            dma_channel_abort(prefetch_dma);
+            xip_ctrl_hw->stream_ctr = 0;
+            while (!(xip_ctrl_hw->stat & XIP_STAT_FIFO_EMPTY)) (void)xip_ctrl_hw->stream_fifo;
+            scanline_bank.fetch_xor(1, std::memory_order_release);
+            prefetch_row = SCANLINE_COUNT;
+        }
         framebuffer = next;
     }
 
+    if (!palette && prefetch_row >= DISPLAY_HEIGHT) prefetch_row -= DISPLAY_HEIGHT;
     next_line_addr = 0;
+    dma_channel_abort(st_dma2);
     dma_channel_abort(st_dma);
     dma_channel_wait_for_finish_blocking(st_dma);
     pio_sm_set_enabled(st_pio, parallel_sm, false);
@@ -233,13 +257,69 @@ void __not_in_flash_func(ST7701::start_frame_xfer)()
     pio_sm_exec(st_pio, parallel_sm, pio_encode_jmp(parallel_offset));
     pio_sm_set_enabled(st_pio, parallel_sm, true);
     display_row = 0;
-    for (int row = 0; row < 4; ++row) memcpy(scanlines[row], &framebuffer[width * row], width * sizeof(uint16_t));
-    next_line_addr = scanlines[0];
-    dma_channel_set_read_addr(st_dma, scanlines[0], true);
+    next_line_addr = palette ? framebuffer : scanlines[scanline_bank.load(std::memory_order_relaxed)][0];
+    if (!palette) {
+        dma_channel_set_read_addr(st_dma2,
+            &scanline_addresses[scanline_bank.load(std::memory_order_relaxed)][1], false);
+    }
+    dma_channel_set_read_addr(st_dma, next_line_addr, true);
 
     presented_framebuffer.store(framebuffer, std::memory_order_release);
     __sev();
 }
+
+  void __not_in_flash_func(ST7701::pause_scanout)() {
+      // Called on the display core before flash/OTA lockout. A DMA read of
+      // PSRAM must not continue while the shared QMI interface programs flash.
+      irq_set_enabled(pio_get_irq_num(st_pio, 0), false);
+      pio_sm_set_enabled(st_pio, timing_sm, false);
+      pio_sm_set_enabled(st_pio, parallel_sm, false);
+      dma_channel_abort(timing_dma);
+      dma_channel_abort(timing_restart_dma);
+      dma_channel_abort(st_dma);
+      dma_channel_abort(st_dma2);
+      dma_channel_abort(prefetch_dma);
+            xip_ctrl_hw->stream_ctr = 0;
+            while (!(xip_ctrl_hw->stat & XIP_STAT_FIFO_EMPTY)) (void)xip_ctrl_hw->stream_fifo;
+  }
+
+  void ST7701::resume_scanout() {
+      if (!palette) {
+          const uint8_t bank = scanline_bank.load(std::memory_order_relaxed);
+          for (uint row = 0; row < SCANLINE_COUNT; ++row)
+              memcpy(scanlines[bank][row], framebuffer + width * row, width * sizeof(uint16_t));
+          prefetch_row = SCANLINE_COUNT;
+      }
+      pio_sm_clear_fifos(st_pio, timing_sm);
+      pio_sm_restart(st_pio, timing_sm);
+      pio_sm_exec(st_pio, timing_sm, pio_encode_jmp(timing_offset));
+      hw_clear_bits(&st_pio->irq, 0x13);
+      start_frame_xfer();
+      pio_sm_set_enabled(st_pio, timing_sm, true);
+      irq_set_enabled(pio_get_irq_num(st_pio, 0), true);
+      dma_channel_set_read_addr(timing_dma, timing_words, true);
+  }
+
+  void __not_in_flash_func(ST7701::wait_for_prefetch)() {
+      // QMI streaming is below CPU accesses in the arbiter. Leave the bus
+      // idle while a row batch is outstanding instead of competing with it.
+      if (!palette) while (dma_channel_is_busy(prefetch_dma)) __asm volatile("nop");
+  }
+
+  void ST7701::set_framebuffer(uint16_t* next_fb) {
+      // Prepare the first rows in the inactive SRAM bank before publishing the
+      // swap. Vertical blank then performs no PSRAM copy or decode work.
+      if (!palette) {
+          const uint8_t bank = scanline_bank.load(std::memory_order_acquire) ^ 1;
+          for (uint row = 0; row < SCANLINE_COUNT; ++row) {
+              wait_for_prefetch();
+              memcpy(scanlines[bank][row], next_fb + width * row, width * sizeof(uint16_t));
+              sleep_us(50);
+          }
+      }
+      requested_framebuffer = next_fb;
+      next_framebuffer.store(next_fb, std::memory_order_release);
+  }
 
   ST7701::ST7701(uint16_t width, uint16_t height, Rotation rotation, SPIPins control_pins, uint16_t* framebuffer, uint32_t* palette,
       uint d0, uint hsync, uint vsync, uint lcd_de, uint lcd_dot_clk) :
@@ -323,7 +403,7 @@ void __not_in_flash_func(ST7701::start_frame_xfer)()
       sm_config_set_in_shift(&c, false, false, 32);
 
       // Determine clock divider
-      uint32_t max_pio_clk = 34 * MHZ;
+      uint32_t max_pio_clk = 18 * MHZ;
       const uint32_t sys_clk_hz = clock_get_hz(clk_sys);
       uint32_t clk_div = (sys_clk_hz + max_pio_clk - 1) / max_pio_clk;
       if (palette && width == 480) {
@@ -382,8 +462,12 @@ void __not_in_flash_func(ST7701::start_frame_xfer)()
 
         config = dma_channel_get_default_config(st_dma2);
         channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
-        channel_config_set_read_increment(&config, false);
-        dma_channel_configure(st_dma2, &config, &dma_hw->ch[st_dma].al3_read_addr_trig, &next_line_addr, 1, false);
+        channel_config_set_read_increment(&config, true);
+        for (uint bank = 0; bank < 2; ++bank)
+            for (uint row = 0; row <= DISPLAY_HEIGHT; ++row)
+                scanline_addresses[bank][row] = scanlines[bank][(row % DISPLAY_HEIGHT) & (SCANLINE_COUNT - 1)];
+        dma_channel_configure(st_dma2, &config, &dma_hw->ch[st_dma].al3_read_addr_trig,
+                              &scanline_addresses[0][1], 1, false);
       }
       else {
         st_dma3 = dma_claim_unused_channel(true);
@@ -415,28 +499,64 @@ void __not_in_flash_func(ST7701::start_frame_xfer)()
         dma_channel_configure(st_dma4, &config, &dma_hw->ch[st_dma3].al3_read_addr_trig, &st_pio->rxf[palette_sm], 1, true);
       }
 
+      if (!palette) {
+        prefetch_dma = dma_claim_unused_channel(true);
+        auto config = dma_channel_get_default_config(prefetch_dma);
+        channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
+        channel_config_set_read_increment(&config, false);
+        channel_config_set_write_increment(&config, true);
+        channel_config_set_dreq(&config, DREQ_XIP_STREAM);
+        dma_channel_configure(prefetch_dma, &config, nullptr,
+                              reinterpret_cast<const void *>(XIP_AUX_BASE), 0, false);
+      }
+
       printf("Begin SPI setup\n");
 
       common_init();
 
       printf("Setup screen timing\n");
 
-      // Setup timing
-      hw_set_bits(&st_pio->inte1, 0x010 << timing_sm);  // TX not full
-      // Remove the MicroPython handler if it's set
-      current = irq_get_exclusive_handler(pio_get_irq_num(st_pio, 1));
-      if(current) irq_remove_handler(pio_get_irq_num(st_pio, 1), current);
-      irq_set_exclusive_handler(pio_get_irq_num(st_pio, 1), timing_isr);
-      irq_set_priority(pio_get_irq_num(st_pio, 1), 0x00);
-      irq_set_enabled(pio_get_irq_num(st_pio, 1), true);
+      // Keep every sync/pixel-clock word in SRAM. Feeding this FIFO from
+      // an ISR lets PSRAM traffic stretch a line while decoding a live frame.
+      for (uint row = 0; row < TIMING_V_FRONT; ++row) {
+        const uint32_t vsync_bit = row >= TIMING_V_PULSE ? 0x80000000u : 0;
+        timing_words[row * 4] = vsync_bit | 0x4000B042u | ((TIMING_H_FRONT - 3) << 16);
+        timing_words[row * 4 + 1] = vsync_bit | 0x0000B042u | ((TIMING_H_PULSE - 3) << 16);
+        timing_words[row * 4 + 2] = vsync_bit | 0x40000000u | ((TIMING_H_BACK - 3) << 16) |
+            (row >= TIMING_V_BACK && row < TIMING_V_DISPLAY ? 0xD004u : 0xB042u);
+        timing_words[row * 4 + 3] = vsync_bit | 0x40000000u | ((TIMING_H_DISPLAY - 3) << 16) |
+            (row == TIMING_V_DISPLAY ? 0xD001u :
+             row >= TIMING_V_BACK - 1 && row < TIMING_V_DISPLAY ? 0xD000u : 0xB042u);
+      }
+      timing_dma = dma_claim_unused_channel(true);
+      timing_restart_dma = dma_claim_unused_channel(true);
+      auto timing_config = dma_channel_get_default_config(timing_dma);
+      channel_config_set_transfer_data_size(&timing_config, DMA_SIZE_32);
+      channel_config_set_dreq(&timing_config, pio_get_dreq(st_pio, timing_sm, true));
+      channel_config_set_chain_to(&timing_config, timing_restart_dma);
+      channel_config_set_high_priority(&timing_config, true);
+      dma_channel_configure(timing_dma, &timing_config, &st_pio->txf[timing_sm],
+                            timing_words, TIMING_V_FRONT * 4, false);
+      auto restart_config = dma_channel_get_default_config(timing_restart_dma);
+      channel_config_set_transfer_data_size(&restart_config, DMA_SIZE_32);
+      channel_config_set_read_increment(&restart_config, false);
+      channel_config_set_write_increment(&restart_config, false);
+      channel_config_set_high_priority(&restart_config, true);
+      dma_channel_configure(timing_restart_dma, &restart_config,
+                            &dma_hw->ch[timing_dma].al3_read_addr_trig,
+                            &timing_words_address, 1, false);
+      // Give scanline reads precedence over non-real-time frame decoding.
+      bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_PROC1_BITS |
+                              BUSCTRL_BUS_PRIORITY_DMA_R_BITS | BUSCTRL_BUS_PRIORITY_DMA_W_BITS;
 
       hw_set_bits(&st_pio->inte0, 0x300); // IRQ 0
       // Remove the MicroPython handler if it's set
       current = irq_get_exclusive_handler(pio_get_irq_num(st_pio, 0));
       if(current) irq_remove_handler(pio_get_irq_num(st_pio, 0), current);
       irq_set_exclusive_handler(pio_get_irq_num(st_pio, 0), end_of_line_isr);
-      irq_set_priority(pio_get_irq_num(st_pio, 0), 0x80);
+      irq_set_priority(pio_get_irq_num(st_pio, 0), 0x00);
       irq_set_enabled(pio_get_irq_num(st_pio, 0), true);
+      dma_start_channel_mask(1u << timing_dma);
     }
 
   void ST7701::common_init() {

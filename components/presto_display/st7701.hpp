@@ -25,7 +25,14 @@ namespace pimoroni {
   /// https://github.com/esphome/esphome/blob/dev/esphome/components/st7701s
   class ST7701 {
     // DMA scans SRAM while the complete frames remain in PSRAM.
-    alignas(4) uint16_t scanlines[4][480];
+    static constexpr uint SCANLINE_COUNT = 128;
+    alignas(4) uint16_t scanlines[2][SCANLINE_COUNT][480] = {};
+    std::atomic<uint8_t> scanline_bank{0};
+    alignas(4) uint16_t *scanline_addresses[2][481] = {};
+    int prefetch_dma = -1;
+    int prefetch_row = SCANLINE_COUNT;
+    static constexpr int PREFETCH_ROWS = 8;
+    std::atomic<uint32_t> prefetch_overruns{0};
     uint16_t width;
     uint16_t height;
     Rotation rotation;
@@ -48,6 +55,10 @@ namespace pimoroni {
     uint parallel_offset;
     uint timing_offset;
     uint palette_offset;
+    alignas(4) uint32_t timing_words[498 * 4];
+    uint32_t *timing_words_address = timing_words;
+    int timing_dma = -1;
+    int timing_restart_dma = -1;
     uint st_dma;
     uint st_dma2;
     int st_dma3 = -1;
@@ -73,6 +84,9 @@ namespace pimoroni {
 
     void init();
     void cleanup();
+    void pause_scanout();
+    void wait_for_prefetch();
+    void resume_scanout();
     void set_backlight(uint8_t brightness);
 
 
@@ -80,10 +94,8 @@ namespace pimoroni {
     // It is MSB aligned, i.e. the top bit of red is in the MSB.
     uint32_t get_encoded_palette_entry(uint8_t entry) const { return palette[entry]; }
 
-    void set_framebuffer(uint16_t* next_fb) {
-      requested_framebuffer = next_fb;
-      next_framebuffer.store(next_fb, std::memory_order_release);
-    }
+    void set_framebuffer(uint16_t* next_fb);
+    uint32_t get_prefetch_overruns() const { return prefetch_overruns.load(std::memory_order_relaxed); }
 
     void wait_for_vsync();
 

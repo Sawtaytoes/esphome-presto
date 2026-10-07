@@ -1,0 +1,4 @@
+examples/secrets.yaml
+examples/.esphome/
+**/__pycache__/
+.ruff_cache/

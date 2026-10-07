@@ -1,4 +1,6 @@
 #pragma once
+#include "esphome/core/defines.h"
+#ifdef USE_PRESTO_AMBIENT
 #include "esphome/components/light/addressable_light.h"
 #include "hardware/pio.h"
 #include <array>
@@ -16,6 +18,7 @@ class PrestoAmbient : public light::AddressableLight {
   }
   void clear_effect_data() override { effect_data_.fill(0); }
   void set_pixels(const uint8_t *rgb);
+
  protected:
   light::ESPColorView get_view_internal(int32_t index) const override;
   void send_pixels_();
@@ -25,4 +28,6 @@ class PrestoAmbient : public light::AddressableLight {
   uint sm_{0};
   uint32_t last_write_{0};
 };
-}
+} // namespace esphome::presto_display
+
+#endif

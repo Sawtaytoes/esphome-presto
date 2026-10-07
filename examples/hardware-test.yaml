@@ -19,15 +19,11 @@ display:
       it.filled_rectangle(0, 0, 160, 480, Color(255, 0, 0));
       it.filled_rectangle(160, 0, 160, 480, Color(0, 255, 0));
       it.filled_rectangle(320, 0, 160, 480, Color(0, 0, 255));
+      for (int row = 40; row < 480; row += 80)
+        it.filled_rectangle(0, row, 480, 4, Color(255, 255, 255));
 
-i2c:
-  sda: GPIO30
-  scl: GPIO31
-  frequency: 100kHz
-  scan: false
 touchscreen:
-  - platform: ft63x6
-    address: 0x48
+  - platform: presto_display
     display: presto_lcd
     update_interval: 20ms
     on_touch:
