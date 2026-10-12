@@ -51,9 +51,15 @@ api:
             uint8_t pixels[21];
             if (backlight < 0 || backlight > 100 || colors.size() != 28 ||
                 esphome::base64_decode(reinterpret_cast<const uint8_t *>(colors.c_str()), colors.size(), pixels, sizeof(pixels)) != 21) return;
-            id(presto_lcd).set_brightness(backlight / 100.0f);
+            id(presto_remote).set_backlight(backlight);
             id(presto_ambient).set_pixels(pixels);
             id(presto_remote).controls_ack(revision, backlight);
+    - action: set_wake_controls
+      variables:
+        wake_backlight: int
+        wake_seconds: int
+      then:
+        - lambda: id(presto_remote).set_wake(wake_backlight, wake_seconds);
 ota:
   - platform: esphome
     encryption: {}
