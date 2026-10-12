@@ -5,6 +5,7 @@
 #include "esphome/core/string_ref.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "miniz_tinfl.h"
+#include "presto_wake.h"
 #include <cstdint>
 #include <functional>
 namespace esphome::presto_display {
@@ -19,12 +20,16 @@ class PrestoRemote : public Component {
                    const StringRef &encoded);
   void touch(int phase, int x, int y);
   void controls_ack(int revision, int backlight);
+  // CastKit's commanded level. Zero is dark, but a press still lights the panel at the wake level.
+  void set_backlight(int percent);
+  void set_wake(int percent, int seconds);
   void set_touch_poller(std::function<void()> poller) { touch_poller_ = std::move(poller); }
   void poll_touch();
   void wait_for_prefetch();
 
  protected:
   void error_(const char *reason);
+  void apply_brightness_();
   bool decode_packet_();
   PrestoDisplay *display_{nullptr};
   text_sensor::TextSensor *events_{nullptr};
@@ -36,7 +41,7 @@ class PrestoRemote : public Component {
   uint32_t presented_at_{0}, last_touch_poll_{0};
   std::function<void()> touch_poller_;
   bool offline_{false};
-  bool touch_enabled_{false};
+  WakeLatch wake_;
   int last_x_{0}, last_y_{0};
 };
 } // namespace esphome::presto_display

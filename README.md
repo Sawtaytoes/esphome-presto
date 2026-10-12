@@ -73,8 +73,17 @@ acknowledged base, and decompresses into a separate scratch buffer. Incomplete,
 out-of-order, corrupt or oversized frames do not reach the displayed buffer.
 Only a complete frame is presented and acknowledged. Lost connections recover
 with a full frame. After seven seconds without a presented frame, the board
-shows an offline marker and disables touch. Touch is also disabled at zero
-backlight brightness.
+shows an offline marker and disables touch.
+
+At zero backlight brightness the panel is dark but still listens for a press.
+The first press lights it at the wake level CastKit sends through
+`set_wake_controls` and is swallowed through its release, so it never presses
+what is under the finger. Later touches reach the page normally and restart the
+wake window; when it lapses (30 seconds by default, never while a finger is
+down) the panel goes dark again. A wake level of zero, or a CastKit that never
+sends one, keeps the old behavior: no touch at zero brightness. The receiver
+reports `wake,1`, `wake,0` and `wake_controls,<percent>,<seconds>` on Display
+Events. The latch is `presto_wake.h`, tested on the host by `tests/test_wake.py`.
 
 ## Development
 

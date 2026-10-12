@@ -134,8 +134,18 @@ bool PrestoRemote::decode_packet_() {
   return decode_pixels(packet_, received_, presented_frame_, patch_, inflater_, copy_pixels_paced);
 }
 void PrestoRemote::touch(int phase, int x, int y) {
-  if (!touch_enabled_ || phase < 0 || phase > 2 || x < 0 || x >= 480 || y < 0 || y >= 480 ||
-      !presented_frame_ || millis() - presented_at_ > 7000) {
+  if (phase < 0 || phase > 2 || x < 0 || x >= 480 || y < 0 || y >= 480) {
+    return;
+  }
+  // The latch sees every contact, including releases while offline, so a swallowed press always
+  // reaches its release.
+  const TouchAction action = wake_.touch(phase, millis());
+  if (action == TouchAction::WAKE) {
+    apply_brightness_();
+    events_->publish_state("wake,1");
+    return;
+  }
+  if (action == TouchAction::DROP || !presented_frame_ || millis() - presented_at_ > 7000) {
     return;
   }
   if (phase == 2) {
@@ -159,13 +169,30 @@ void PrestoRemote::poll_touch() {
     touch_poller_();
   }
 }
+void PrestoRemote::apply_brightness_() {
+  display_->set_brightness(wake_.brightness() / 100.0f);
+}
+void PrestoRemote::set_backlight(int percent) {
+  wake_.set_backlight(percent);
+  apply_brightness_();
+}
+void PrestoRemote::set_wake(int percent, int seconds) {
+  wake_.set_wake(percent, seconds);
+  apply_brightness_();
+  char event[48];
+  snprintf(event, sizeof(event), "wake_controls,%d,%d", percent, seconds);
+  events_->publish_state(event);
+}
 void PrestoRemote::controls_ack(int revision, int backlight) {
-  touch_enabled_ = backlight > 0;
   char event[64];
   snprintf(event, sizeof(event), "controls,%d,%d", revision, backlight);
   events_->publish_state(event);
 }
 void PrestoRemote::loop() {
+  if (wake_.expire(millis())) {
+    apply_brightness_();
+    events_->publish_state("wake,0");
+  }
   if (!presented_frame_ || offline_ || millis() - presented_at_ <= 7000) {
     return;
   }
