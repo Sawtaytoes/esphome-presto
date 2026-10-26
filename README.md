@@ -87,10 +87,12 @@ for it; the marker appears only if that frame fails. A live frame that receives 
 chunk for three seconds is abandoned, so a sender that stops part way never holds
 back the offline marker or the idle work below.
 
-The second framebuffer is synchronized lazily: before a patch, only the area
-where it is stale and the patch does not cover is copied from the visible one. A
-stream that redraws the same region (a clock, a camera) or a full-frame swipe
-copies nothing.
+After a swap, the new back framebuffer differs from the picture only where the
+last frame drew. Idle time copies that area from the visible framebuffer in small
+paced steps, starting 150 ms after the last live chunk, so a continuous stream is
+not slowed and a later small patch (a clock tick) copies nothing. A patch that
+arrives before the copy is done copies only the area that is still stale and that
+the patch does not cover. Idle work stops whenever a live frame is arriving.
 
 ### Frame slots
 

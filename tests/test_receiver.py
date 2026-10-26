@@ -15,6 +15,7 @@ from test_pixels import rle_encode
 PANEL = 480
 FRAME = PANEL * PANEL * 2
 FULL = (0, 0, PANEL, PANEL)
+SYNC_DELAY_MS = 150
 SIGNATURES = {
     "create": ([ctypes.c_int], ctypes.c_void_p),
     "destroy": ([ctypes.c_void_p], None),
@@ -240,6 +241,46 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(timing[0], "timing")
         self.assertEqual(len(timing), 10)
 
+    def sync_bytes(self):
+        # timing,<frame>,<rect bytes>,<decode>,<write>,<sync us>,<sync bytes>,...
+        timing = [line for line in self.board.timings() if line.startswith("timing,")][-1]
+        return int(timing.split(",")[6])
+
+    def test_idle_sync_after_a_live_frame_makes_the_next_patch_free(self):
+        image = view(self.rng)
+        self.show_live(1, image)
+        # Right after a frame the sync waits, so a continuous stream is not slowed.
+        self.assertFalse(self.board.step())
+        self.assertTrue(self.board.is_settling())
+        self.board.advance(SYNC_DELAY_MS)
+        self.board.idle()
+        self.assertFalse(self.board.is_settling())
+        self.assertEqual(self.board.timings()[-1].split(",")[:2], ["settled", str(FRAME)])
+        self.assertEqual(self.board.own(0), image)
+        self.assertEqual(self.board.own(1), image)
+        rect = (300, 20, 71, 96)
+        image = paste(image, rect, self.rng.randbytes(71 * 96 * 2))
+        self.show_live(2, image, base=1, rect=rect)
+        self.assertEqual(self.sync_bytes(), 0)
+
+    def test_a_patch_during_idle_sync_stays_exact(self):
+        image = view(self.rng)
+        self.show_live(1, image)
+        self.board.advance(SYNC_DELAY_MS)
+        for _ in range(5):
+            self.board.step()
+        # Rows 0..79 are synchronized; the patch straddles that line.
+        rect = (100, 50, 50, 100)
+        image = paste(image, rect, self.rng.randbytes(50 * 100 * 2))
+        self.show_live(2, image, base=1, rect=rect)
+        self.assertEqual(self.sync_bytes(), 400 * PANEL * 2 - 50 * 70 * 2)
+        self.board.advance(SYNC_DELAY_MS)
+        self.board.idle()
+        rect = (10, 400, 30, 30)
+        image = paste(image, rect, self.rng.randbytes(30 * 30 * 2))
+        self.show_live(3, image, base=2, rect=rect)
+        self.assertEqual(self.sync_bytes(), 0)
+
     def test_lazy_sync_copies_nothing_for_a_repeated_region(self):
         image = view(self.rng)
         self.show_live(1, image)
@@ -369,6 +410,7 @@ class ReceiverTests(unittest.TestCase):
                 for _ in range(self.rng.randrange(0, 80)):
                     self.board.step()
                 self.assertEqual(self.board.picture(), expected)
+        self.board.advance(SYNC_DELAY_MS)
         self.board.idle()
         self.assertFalse(self.board.is_settling())
         self.assertFalse(self.board.is_slot_visible())
@@ -839,7 +881,12 @@ class RandomRun:
             elif action < 0.79:
                 self.advance(7100)
                 self.step()
-            elif action < 0.84 and self.live and not self.live["is_orphan"]:
+            elif action < 0.81:
+                # A pause long enough for idle sync to start, sometimes to finish.
+                self.advance(rng.choice([160, 400]))
+                for _ in range(rng.randrange(1, 40)):
+                    self.step()
+            elif action < 0.86 and self.live and not self.live["is_orphan"]:
                 # A slow sender: the picture can go stale while a frame is still arriving.
                 self.advance(2500)
                 self.step()
@@ -854,6 +901,8 @@ class RandomRun:
             self.check()
         while self.upload is not None:
             self.send_upload()
+        # Let a half-sent live frame stall out so the idle work can finish.
+        self.advance(3100)
         for _ in range(10000):
             if not self.step():
                 break
