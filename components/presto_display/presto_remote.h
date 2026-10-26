@@ -26,6 +26,9 @@ class PrestoRemote : public Component, public Panel {
   // Optional diagnostic sensor. A separate entity, so a timing report can never replace a
   // queued acknowledgement in ESPHome's one-state-per-entity send buffer.
   void set_timing(text_sensor::TextSensor *timing) { timing_ = timing; }
+  // The live codecs this firmware decodes, `zlib,rle,jpeg`. CastKit sends JPEG only to a board
+  // that lists `jpeg` here.
+  void set_codecs(text_sensor::TextSensor *codecs) { codecs_ = codecs; }
   void frame_chunk(int frame_id, int touch_id, int format, int offset, bool final_chunk,
                    const StringRef &encoded);
   void slot_chunk(int slot, int frame_id, int format, int offset, bool final_chunk,
@@ -60,7 +63,8 @@ class PrestoRemote : public Component, public Panel {
   bool is_ready_();
   void apply_brightness_();
   PrestoDisplay *display_{nullptr};
-  text_sensor::TextSensor *events_{nullptr}, *slot_events_{nullptr}, *timing_{nullptr};
+  text_sensor::TextSensor *events_{nullptr}, *slot_events_{nullptr}, *timing_{nullptr},
+      *codecs_{nullptr};
   Receiver receiver_;
   HighFrequencyLoopRequester high_frequency_;
   uint32_t last_touch_poll_{0};

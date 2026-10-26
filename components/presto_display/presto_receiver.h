@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "miniz_tinfl.h"
+#include "presto_jpeg.h"
 #include "presto_stream.h"
 
 namespace esphome::presto_display {
@@ -33,10 +34,10 @@ enum SlotStatus : int {
   SLOT_DROPPED = 5, // drop_slots arrived while the final chunk was still decoding
 };
 
-class Panel : public PixelWriter {
+class Panel : public PixelWriter, public PixelReader {
  public:
   // PSRAM -> SRAM, behind the scanout prefetch gate.
-  virtual void read(uint8_t *to, const uint8_t *from, size_t size) = 0;
+  void read(uint8_t *to, const uint8_t *from, size_t size) override = 0;
   // The display's two framebuffers, and the buffer the scanout reads now.
   virtual uint8_t *framebuffer(int index) = 0;
   virtual uint8_t *visible() = 0;
@@ -62,11 +63,21 @@ class Panel : public PixelWriter {
 
 class Receiver {
  public:
-  explicit Receiver(Panel *panel) : panel_(panel), live_writer_(panel), slot_writer_(panel) {}
-  // Allocates the two inflate states and dictionaries (SRAM). False if that failed.
+  explicit Receiver(Panel *panel)
+      : panel_(panel), live_writer_(panel), slot_writer_(panel), live_jpeg_(panel) {}
+  // Allocates the two inflate states and dictionaries (SRAM). False if that failed. Also
+  // allocates the JPEG decoder state; without it, live JPEG patches are refused.
   bool begin();
   // Frame slots, FRAME_BYTES each (PSRAM on the board). `count` may be 0.
   void set_slots(uint8_t *const *slots, int count);
+  // Where a live JPEG body is collected (PSRAM on the board, JPEG_BODY_LIMIT bytes). Without
+  // it, codec 2 answers `error,jpeg_unavailable`.
+  void set_jpeg_buffer(uint8_t *buffer, size_t capacity) {
+    live_jpeg_.set_buffer(buffer, capacity);
+  }
+  bool has_jpeg() const { return live_jpeg_.is_ready(); }
+  // The Display Codecs state: the live codecs this receiver decodes.
+  const char *codecs() const { return has_jpeg() ? "zlib,rle,jpeg" : "zlib,rle"; }
 
   // API actions. `encoded` is base64, at most 4,000 characters per chunk.
   void frame_chunk(int frame_id, int touch_id, int format, int offset, bool final_chunk,
@@ -150,6 +161,8 @@ class Receiver {
   tinfl_decompressor *live_inflater_{nullptr}, *slot_inflater_{nullptr};
   uint8_t *live_dictionary_{nullptr}, *slot_dictionary_{nullptr};
   StreamDecoder *live_decoder_{nullptr}, *slot_decoder_{nullptr};
+  // Live frames only: a slot upload is decoded in bounded steps, and a JPEG is not.
+  JpegDecoder live_jpeg_;
 
   uint8_t *own_[2]{nullptr, nullptr};
   Rect stale_[2];

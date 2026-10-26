@@ -137,9 +137,16 @@ text_sensor:
     update_interval: never
     entity_category: diagnostic
     disabled_by_default: true
+  - platform: template
+    name: Display Codecs
+    id: display_codecs
+    update_interval: never
+    entity_category: diagnostic
+    disabled_by_default: true
 presto_display:
   id: presto_remote
   display_id: presto_lcd
   events_id: display_events
   slot_events_id: display_slot_events
   timing_id: display_timing
+  codecs_id: display_codecs

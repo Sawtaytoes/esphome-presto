@@ -1,6 +1,7 @@
 #include "presto_stream.h"
 #include <algorithm>
 #include <cstring>
+#include "presto_jpeg.h"
 
 namespace esphome::presto_display {
 
@@ -54,7 +55,7 @@ bool parse_header(const uint8_t *p, uint32_t current_frame, PatchHeader &header)
   header.codec = p[12];
   const Rect &r = header.rect;
   return r.width && r.height && r.x + r.width <= PANEL && r.y + r.height <= PANEL &&
-         header.codec <= 1 && (!header.base || header.base == current_frame) &&
+         header.codec <= CODEC_JPEG && (!header.base || header.base == current_frame) &&
          (header.base || (!r.x && !r.y && r.width == PANEL && r.height == PANEL));
 }
 
@@ -65,13 +66,20 @@ void StreamDecoder::begin(const PatchHeader &header, uint8_t *target, int stride
   expected_ = header.rect.bytes();
   produced_ = position_ = pending_at_ = pending_ = 0;
   is_failed_ = is_complete_ = false;
+  failure_ = nullptr;
   inflate_status_ = TINFL_STATUS_HAS_MORE_OUTPUT;
   control_have_ = value_have_ = 0;
   literal_left_ = repeat_left_ = repeat_count_ = 0;
   is_repeat_pending_ = false;
-  if (header.codec == 0) {
+  if (header.codec == CODEC_ZLIB) {
     tinfl_init(inflater_);
+  } else if (header.codec == CODEC_JPEG && jpeg_) {
+    jpeg_->begin();
   }
+}
+
+bool StreamDecoder::has_jpeg() const {
+  return jpeg_ && jpeg_->is_ready();
 }
 
 // Write output bytes at the rectangle's stride. A full-width rectangle is contiguous.
@@ -113,8 +121,14 @@ StreamDecoder::Status StreamDecoder::feed(const uint8_t *data, size_t size, bool
   if (is_complete_) {
     return size ? Status::FAILED : Status::COMPLETE;
   }
-  const Status status = header_.codec == 0 ? feed_zlib_(data, size, is_last, consumed, budget)
-                                           : feed_rle_(data, size, is_last, consumed, budget);
+  Status status;
+  if (header_.codec == CODEC_ZLIB) {
+    status = feed_zlib_(data, size, is_last, consumed, budget);
+  } else if (header_.codec == CODEC_RLE) {
+    status = feed_rle_(data, size, is_last, consumed, budget);
+  } else {
+    status = feed_jpeg_(data, size, is_last, consumed);
+  }
   is_failed_ = status == Status::FAILED;
   is_complete_ = status == Status::COMPLETE;
   return status;
@@ -225,6 +239,31 @@ StreamDecoder::Status StreamDecoder::feed_rle_(const uint8_t *data, size_t size,
   return produced_ == expected_ && !literal_left_ && !is_repeat_pending_ && !control_have_
              ? Status::COMPLETE
              : Status::FAILED;
+}
+
+// Collect the body; decode it whole once the last bytes are in. The output budget does not
+// apply: the decode runs in one piece, which is why only live frames take JPEG.
+StreamDecoder::Status StreamDecoder::feed_jpeg_(const uint8_t *data, size_t size, bool is_last,
+                                                size_t &consumed) {
+  if (!has_jpeg()) {
+    failure_ = "jpeg_unavailable";
+    return Status::FAILED;
+  }
+  if (!jpeg_->append(data, size, writer_)) {
+    failure_ = jpeg_reason(JpegResult::TOO_LARGE);
+    return Status::FAILED;
+  }
+  consumed = size;
+  if (!is_last) {
+    return Status::NEED_INPUT;
+  }
+  const JpegResult result = jpeg_->decode(header_.rect, target_, stride_, writer_);
+  if (result != JpegResult::OK) {
+    failure_ = jpeg_reason(result);
+    return Status::FAILED;
+  }
+  produced_ = expected_;
+  return Status::COMPLETE;
 }
 
 } // namespace esphome::presto_display

@@ -14,6 +14,20 @@ Its source headers retain upstream content alongside `MINIZ-LICENSE`.
 `miniz_tinfl.c` adds a conditional RP2 RAM-section annotation to the inflater;
 the decoding algorithm is unchanged. `miniz_export.h` supplies the static-build export macro.
 
+The baseline JPEG decoder (codec 2) is JPEGDEC 1.8.5 by Larry Bank, BitBank Software, Inc.,
+Apache License 2.0, commit 0e879642e5e68624687f9ade16d799a091298ec8:
+https://github.com/bitbank2/JPEGDEC/tree/0e879642e5e68624687f9ade16d799a091298ec8
+`JPEGDEC.h` is upstream `src/JPEGDEC.h`, unchanged, with `JPEGDEC-LICENSE`. `JPEGDEC.cpp`
+is upstream `src/JPEGDEC.cpp` with its `#include "jpeg.inl"` replaced by the verbatim text of
+`src/jpeg.inl`, between two marked comment blocks. ESPHome does not copy a `.inl` file into a
+build, and it includes every `.h` of a component into `main.cpp`, where the definitions in
+`jpeg.inl` would be duplicated, so the file cannot stay separate. Deleting the marked block
+and restoring the include line gives the upstream file byte for byte. The ESP32-S3
+assembly, the Cortex-M4 SIMD header, and `JPEGDisplay` are not vendored; none is built for
+the RP2350. Host tests define
+`__LINUX__` (standard headers instead of Arduino) and `NO_SIMD` (no SSE), so they run the same
+portable C path as the board.
+
 The native-resolution experiment keeps two full RGB565 frames in PSRAM and
 prefetches rows via the paced XIP streaming FIFO into two 128-row SRAM banks
 in eight-row batches. Timing words run from a cyclic SRAM

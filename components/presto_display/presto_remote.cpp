@@ -28,6 +28,18 @@ void PrestoRemote::setup() {
     mark_failed();
     return;
   }
+  // The live JPEG body buffer, before the slots so they cannot take its PSRAM. Without it (or
+  // without the decoder state) the board refuses codec 2 and does not advertise it.
+  auto *jpeg = static_cast<uint8_t *>(pmalloc(JPEG_BODY_LIMIT));
+  if (jpeg) {
+    receiver_.set_jpeg_buffer(jpeg, JPEG_BODY_LIMIT);
+  }
+  if (!receiver_.has_jpeg()) {
+    ESP_LOGW(TAG, "No memory for JPEG patches; live frames use zlib and RLE only");
+  }
+  if (codecs_) {
+    codecs_->publish_state(receiver_.codecs());
+  }
   // Frame slots live in PSRAM for the life of the firmware; drop_slots only empties them.
   // A slot that could not be allocated answers every upload with SLOT_UNAVAILABLE.
   uint8_t *slots[SLOT_COUNT];
