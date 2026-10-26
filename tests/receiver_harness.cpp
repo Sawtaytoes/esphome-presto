@@ -14,6 +14,10 @@ class HostPanel : public Panel {
     shown_ = own_[1].data();
   }
   void write(uint8_t *to, const uint8_t *from, size_t size) override {
+    // Nothing may ever write into the buffer the scanout is reading.
+    if (to < shown_ + FRAME_BYTES && shown_ < to + size) {
+      ++visible_writes;
+    }
     memcpy(to, from, size);
     written += size;
   }
@@ -41,19 +45,39 @@ class HostPanel : public Panel {
     memcpy(own_[drawing_].data(), back, FRAME_BYTES);
     ++shows;
   }
-  void publish(const char *event) override { events.emplace_back(event); }
-  void publish_timing(const char *report) override { timings.emplace_back(report); }
+  void publish(const char *event) override {
+    events.emplace_back(event);
+    count_(0);
+  }
+  void publish_slot(const char *event) override {
+    slot_events.emplace_back(event);
+    count_(1);
+  }
+  void publish_timing(const char *report) override {
+    timings.emplace_back(report);
+    count_(2);
+  }
+  // Every harness entry point is one ESPHome call: an action, or one loop() step.
+  void begin_call() { published_[0] = published_[1] = published_[2] = 0; }
   uint32_t micros() override { return now_ms * 1000; }
   uint32_t millis() override { return now_ms; }
   uint32_t overruns() override { return 0; }
   size_t free_psram() override { return 4242; }
 
-  std::vector<std::string> events, timings;
+  std::vector<std::string> events, slot_events, timings;
+  // ESPHome keeps only the newest unsent state per entity: one call must not publish two.
+  int double_publishes{0}, visible_writes{0};
   uint32_t now_ms{1000};
   size_t written{0};
   int shows{0};
 
  private:
+  void count_(int entity) {
+    if (++published_[entity] > 1) {
+      ++double_publishes;
+    }
+  }
+  int published_[3]{};
   std::vector<uint8_t> own_[2];
   uint8_t *shown_;
   int drawing_{0};
@@ -64,6 +88,16 @@ struct Bench {
   Receiver receiver{&panel};
   std::vector<std::vector<uint8_t>> slots;
 };
+Bench &begin(void *bench) {
+  auto *b = static_cast<Bench *>(bench);
+  b->panel.begin_call();
+  return *b;
+}
+
+bool inside(const Rect &rect, int x, int y) {
+  return !rect.empty() && x >= rect.x && x < rect.x + rect.width && y >= rect.y &&
+         y < rect.y + rect.height;
+}
 } // namespace
 
 extern "C" {
@@ -86,22 +120,20 @@ void destroy(void *bench) {
 }
 void frame_chunk(void *bench, int frame_id, int touch_id, int format, int offset, bool final_chunk,
                  const char *encoded, size_t size) {
-  static_cast<Bench *>(bench)->receiver.frame_chunk(frame_id, touch_id, format, offset, final_chunk,
-                                                    encoded, size);
+  begin(bench).receiver.frame_chunk(frame_id, touch_id, format, offset, final_chunk, encoded, size);
 }
 void slot_chunk(void *bench, int slot, int frame_id, int format, int offset, bool final_chunk,
                 const char *encoded, size_t size) {
-  static_cast<Bench *>(bench)->receiver.slot_chunk(slot, frame_id, format, offset, final_chunk,
-                                                   encoded, size);
+  begin(bench).receiver.slot_chunk(slot, frame_id, format, offset, final_chunk, encoded, size);
 }
 void show_slot(void *bench, int slot, int touch_id) {
-  static_cast<Bench *>(bench)->receiver.show_slot(slot, touch_id);
+  begin(bench).receiver.show_slot(slot, touch_id);
 }
 void drop_slots(void *bench) {
-  static_cast<Bench *>(bench)->receiver.drop_slots();
+  begin(bench).receiver.drop_slots();
 }
 bool step(void *bench) {
-  return static_cast<Bench *>(bench)->receiver.step();
+  return begin(bench).receiver.step();
 }
 void advance(void *bench, unsigned ms) {
   static_cast<Bench *>(bench)->panel.now_ms += ms;
@@ -111,6 +143,46 @@ int event_count(void *bench) {
 }
 const char *event(void *bench, int index) {
   return static_cast<Bench *>(bench)->panel.events[index].c_str();
+}
+int slot_event_count(void *bench) {
+  return int(static_cast<Bench *>(bench)->panel.slot_events.size());
+}
+const char *slot_event(void *bench, int index) {
+  return static_cast<Bench *>(bench)->panel.slot_events[index].c_str();
+}
+int double_publishes(void *bench) {
+  return static_cast<Bench *>(bench)->panel.double_publishes;
+}
+int visible_writes(void *bench) {
+  return static_cast<Bench *>(bench)->panel.visible_writes;
+}
+// Pixels where a framebuffer differs from the picture outside the area the receiver
+// tracks as stale (or is decoding a live frame into). Must always be 0.
+int untracked_differences(void *bench) {
+  auto *b = static_cast<Bench *>(bench);
+  if (!b->receiver.is_attached()) {
+    return 0;
+  }
+  const uint8_t *shown = b->panel.visible();
+  int count = 0;
+  for (int index = 0; index < 2; ++index) {
+    const uint8_t *own = b->panel.framebuffer(index);
+    if (own == shown) {
+      continue;
+    }
+    const Rect stale = b->receiver.stale(index);
+    const Rect live = index == b->receiver.back_index() ? b->receiver.live_rect() : Rect{};
+    for (int y = 0; y < PANEL; ++y) {
+      for (int x = 0; x < PANEL; ++x) {
+        const size_t at = (size_t(y) * PANEL + x) * 2;
+        if (!inside(stale, x, y) && !inside(live, x, y) &&
+            (own[at] != shown[at] || own[at + 1] != shown[at + 1])) {
+          ++count;
+        }
+      }
+    }
+  }
+  return count;
 }
 int timing_count(void *bench) {
   return int(static_cast<Bench *>(bench)->panel.timings.size());

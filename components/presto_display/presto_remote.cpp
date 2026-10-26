@@ -63,7 +63,7 @@ void PrestoRemote::slot_chunk(int slot, int frame_id, int format, int offset, bo
     if (final_chunk) {
       char event[64];
       snprintf(event, sizeof(event), "slot,%d,%d,%d", slot, frame_id, int(SLOT_UNAVAILABLE));
-      publish(event);
+      publish_slot(event);
     }
     return;
   }
@@ -216,6 +216,12 @@ void PrestoRemote::blank() {
 
 void PrestoRemote::publish(const char *event) {
   events_->publish_state(event);
+}
+
+void PrestoRemote::publish_slot(const char *event) {
+  if (slot_events_) {
+    slot_events_->publish_state(event);
+  }
 }
 
 void PrestoRemote::publish_timing(const char *report) {

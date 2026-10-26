@@ -32,6 +32,11 @@ SIGNATURES = {
     "advance": ([ctypes.c_void_p, ctypes.c_uint], None),
     "event_count": ([ctypes.c_void_p], ctypes.c_int),
     "event": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_char_p),
+    "slot_event_count": ([ctypes.c_void_p], ctypes.c_int),
+    "slot_event": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_char_p),
+    "double_publishes": ([ctypes.c_void_p], ctypes.c_int),
+    "visible_writes": ([ctypes.c_void_p], ctypes.c_int),
+    "untracked_differences": ([ctypes.c_void_p], ctypes.c_int),
     "timing_count": ([ctypes.c_void_p], ctypes.c_int),
     "timing": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_char_p),
     "visible": ([ctypes.c_void_p], ctypes.c_void_p),
@@ -97,7 +102,7 @@ class Board:
     def __init__(self, native, slot_count=6):
         self.native = native
         self.handle = native.create(slot_count)
-        self.seen = 0
+        self.seen = self.slot_seen = 0
 
     def close(self):
         self.native.destroy(self.handle)
@@ -110,6 +115,12 @@ class Board:
         count = self.event_count()
         events = [self.event(i).decode() for i in range(self.seen, count)]
         self.seen = count
+        return events
+
+    def new_slot_events(self):
+        count = self.slot_event_count()
+        events = [self.slot_event(i).decode() for i in range(self.slot_seen, count)]
+        self.slot_seen = count
         return events
 
     def timings(self):
@@ -183,7 +194,13 @@ class ReceiverTests(unittest.TestCase):
         self.rng = random.Random(self._testMethodName)
 
     def tearDown(self):
+        self.assert_invariants()
         self.board.close()
+
+    def assert_invariants(self):
+        self.assertEqual(self.board.visible_writes(), 0, "a write reached the visible buffer")
+        self.assertEqual(self.board.double_publishes(), 0, "one call published twice")
+        self.assertEqual(self.board.untracked_differences(), 0, "stale tracking is wrong")
 
     def assert_ack(self, events, frame_id, touch_id):
         self.assertEqual(len(events), 1, events)
@@ -200,7 +217,8 @@ class ReceiverTests(unittest.TestCase):
         before = self.board.picture()
         self.board.slot(slot, frame_id, packet(base, rect, crop(image, rect), codec), between)
         self.board.idle()
-        self.assertEqual(self.board.new_events(), [f"slot,{slot},{frame_id},0"])
+        self.assertEqual(self.board.new_slot_events(), [f"slot,{slot},{frame_id},0"])
+        self.assertEqual(self.board.new_events(), [])
         self.assertEqual(self.board.slot_pixels(slot), image)
         self.assertEqual(self.board.slot_frame(slot), frame_id)
         # A slot upload never touches the picture.
@@ -290,9 +308,10 @@ class ReceiverTests(unittest.TestCase):
         self.show_live(1, view(self.rng))
         # A solid frame is one small chunk but 460,800 B of output: more than one budget.
         self.board.slot(2, 50, packet(0, FULL, b"\x12\x34" * (PANEL * PANEL)))
-        self.assertEqual(self.board.new_events(), [])
+        self.assertEqual(self.board.new_slot_events(), [])
         self.board.idle()
-        self.assertEqual(self.board.new_events(), ["slot,2,50,0"])
+        self.assertEqual(self.board.new_slot_events(), ["slot,2,50,0"])
+        self.assertEqual(self.board.new_events(), [])
 
     def test_show_slot_acknowledges_with_the_slot_frame(self):
         self.show_live(1, view(self.rng))
@@ -318,10 +337,13 @@ class ReceiverTests(unittest.TestCase):
         solid = b"\x00\x1f" * (PANEL * PANEL)
         self.board.slot(1, 60, packet(0, FULL, solid))
         self.board.show_slot(1, 4)
-        events = self.board.new_events()
-        self.assertEqual(events[0], "slot,1,60,0")
-        self.assert_ack(events[1:], 60, 4)
+        # The acknowledgement is alone on Display Events; the slot report follows on its own
+        # entity at the next loop step.
+        self.assert_ack(self.board.new_events(), 60, 4)
         self.assertEqual(self.board.picture(), solid)
+        self.assertEqual(self.board.new_slot_events(), [])
+        self.board.step()
+        self.assertEqual(self.board.new_slot_events(), ["slot,1,60,0"])
 
     def test_slot_stays_after_showing_and_swipes_back_and_forth(self):
         home = view(self.rng)
@@ -384,17 +406,19 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(self.board.presented_frame(), 1)
         full = packet(0, FULL, image)
         self.board.slot(6, 5, full)
-        self.assertEqual(self.board.new_events(), ["slot,6,5,4"])
+        self.board.idle()
+        self.assertEqual(self.board.new_slot_events(), ["slot,6,5,4"])
         self.board.slot(0, 0, full)
-        self.assertEqual(self.board.new_events(), ["slot,0,0,1"])
+        self.board.idle()
+        self.assertEqual(self.board.new_slot_events(), ["slot,0,0,1"])
         # A patch needs the slot's current frame as its base.
         self.board.slot(1, 7, packet(99, (0, 0, 2, 2), bytes(8)))
         self.board.idle()
-        self.assertEqual(self.board.new_events(), ["slot,1,7,3"])
+        self.assertEqual(self.board.new_slot_events(), ["slot,1,7,3"])
         # Base 0 must be a full frame.
         self.board.slot(1, 8, packet(0, (0, 0, 2, 2), bytes(8)))
         self.board.idle()
-        self.assertEqual(self.board.new_events(), ["slot,1,8,3"])
+        self.assertEqual(self.board.new_slot_events(), ["slot,1,8,3"])
         # A gap in the chunks fails the upload; the final chunk reports it.
         pieces = chunks(packet(0, FULL, view(self.rng, noise=150)))
         self.assertGreater(len(pieces), 2)
@@ -402,7 +426,7 @@ class ReceiverTests(unittest.TestCase):
             if index != 1:
                 self.board.slot_chunk(2, 9, 4, offset, is_final, piece, len(piece))
         self.board.idle()
-        self.assertEqual(self.board.new_events(), ["slot,2,9,2"])
+        self.assertEqual(self.board.new_slot_events(), ["slot,2,9,2"])
         self.assertEqual(self.board.slot_frame(2), 0)
         # A corrupt body fails and leaves the slot empty.
         self.upload(2, 20, view(self.rng))
@@ -410,7 +434,7 @@ class ReceiverTests(unittest.TestCase):
         bad[-3] ^= 0xFF
         self.board.slot(2, 21, bytes(bad))
         self.board.idle()
-        self.assertEqual(self.board.new_events(), ["slot,2,21,3"])
+        self.assertEqual(self.board.new_slot_events(), ["slot,2,21,3"])
         self.assertEqual(self.board.slot_frame(2), 0)
         self.board.show_slot(2, 0)
         self.assertEqual(self.board.new_events(), ["error,slot_unavailable"])
@@ -438,7 +462,7 @@ class ReceiverTests(unittest.TestCase):
                 self.assert_ack(self.board.new_events(), frame_id, 0)
                 self.assertEqual(self.board.picture(), image)
         self.board.idle()
-        self.assertEqual(self.board.new_events(), ["slot,5,300,0"])
+        self.assertEqual(self.board.new_slot_events(), ["slot,5,300,0"])
         self.assertEqual(self.board.slot_pixels(5), cached)
         self.assertEqual(self.board.picture(), image)
 
@@ -477,7 +501,7 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(events[-1].split(",")[:2], ["frame", "2"])
         self.assertEqual(self.board.picture(), image)
         self.board.idle()
-        self.assertEqual(self.board.new_events(), ["slot,0,41,0"])
+        self.assertEqual(self.board.new_slot_events(), ["slot,0,41,0"])
         self.assertEqual(self.board.slot_pixels(0), replacement)
 
     def test_drop_slots(self):
@@ -499,72 +523,353 @@ class ReceiverTests(unittest.TestCase):
         self.board.drop_slots()
         for offset, is_final, piece in pieces[1:]:
             self.board.slot_chunk(2, 80, 4, offset, is_final, piece, len(piece))
-        self.assertEqual(self.board.new_events(), ["slot,2,80,2"])
+        self.board.step()
+        self.assertEqual(self.board.new_slot_events(), ["slot,2,80,2"])
         # A final chunk still decoding is reported as dropped.
         self.board.slot(3, 81, packet(0, FULL, b"\x00\x00" * (PANEL * PANEL)))
         self.board.drop_slots()
-        self.assertEqual(self.board.new_events(), ["slot,3,81,5"])
+        self.board.step()
+        self.assertEqual(self.board.new_slot_events(), ["slot,3,81,5"])
+        self.assertEqual(self.board.new_events(), [])
         self.assertEqual(self.board.picture(), cached)
         self.board.idle()
         self.assertFalse(self.board.is_slot_visible())
         self.assertEqual(self.board.picture(), cached)
 
+    def test_one_call_never_publishes_twice_on_an_entity(self):
+        self.show_live(1, view(self.rng))
+        # The first upload's final chunk is still decoding when the second one, which fails
+        # at once, arrives: two reports are due in one call.
+        self.board.slot(0, 10, packet(0, FULL, b"\x12\x34" * (PANEL * PANEL)))
+        self.board.slot(1, 11, packet(99, (0, 0, 2, 2), bytes(8)))
+        self.assertEqual(self.board.double_publishes(), 0)
+        self.board.idle()
+        self.assertEqual(self.board.new_slot_events(), ["slot,0,10,0", "slot,1,11,3"])
+        self.assertEqual(self.board.new_events(), [])
+
+    def test_a_stalled_first_frame_is_abandoned(self):
+        # No frame yet: the first one stops after its first chunk.
+        stalled = chunks(packet(0, FULL, view(self.rng, noise=200)))
+        self.board.frame_chunk(1, 0, 4, 0, False, stalled[0][2], len(stalled[0][2]))
+        self.board.slot(0, 10, packet(0, FULL, b"\x12\x34" * (PANEL * PANEL)))
+        for _ in range(50):
+            self.board.step()
+        # Idle work waits for the live frame...
+        self.assertEqual(self.board.new_slot_events(), [])
+        self.board.advance(3001)
+        self.board.idle()
+        # ...until it has been silent for three seconds.
+        self.assertEqual(self.board.new_slot_events(), ["slot,0,10,0"])
+        offset, is_final, piece = stalled[1]
+        self.board.frame_chunk(1, 0, 4, offset, is_final, piece, len(piece))
+        self.assertEqual(self.board.new_events(), ["error,chunk_order_or_size"])
+        self.show_live(2, view(self.rng))
+
+    def send_spaced(self, frame_id, pieces, spacing):
+        for offset, is_final, piece in pieces:
+            self.board.advance(spacing)
+            self.board.step()
+            self.board.frame_chunk(frame_id, 0, 4, offset, is_final, piece, len(piece))
+
+    def test_offline_keeps_a_full_frame_in_transit(self):
+        old = view(self.rng)
+        self.show_live(1, old)
+        image = view(self.rng, noise=200)
+        pieces = chunks(packet(0, FULL, image))
+        self.send_spaced(2, pieces[:3], 2500)
+        self.board.advance(100)
+        self.board.step()
+        # Offline: touches stop, but the blank waits for the full frame on its way.
+        self.assertEqual(self.board.presented_frame(), 0)
+        self.assertEqual(self.board.touch_frame(), 0)
+        self.assertEqual(self.board.picture(), old)
+        self.send_spaced(2, pieces[3:], 10)
+        self.assert_ack(self.board.new_events(), 2, 0)
+        self.assertEqual(self.board.picture(), image)
+        self.assertEqual(self.board.presented_frame(), 2)
+
+    def test_offline_blank_follows_a_failed_full_frame(self):
+        self.show_live(1, view(self.rng))
+        pieces = chunks(packet(0, FULL, view(self.rng, noise=200))[:-5])
+        self.send_spaced(2, pieces[:3], 2500)
+        self.board.advance(100)
+        self.board.step()
+        self.send_spaced(2, pieces[3:], 10)
+        self.assertEqual(self.board.new_events(), ["error,invalid_packet_or_base"])
+        self.board.step()
+        self.assertEqual(self.board.picture()[:2], b"\xf8\x00")
+
+    def test_offline_abandons_a_patch_in_transit(self):
+        image = view(self.rng)
+        self.show_live(1, image)
+        rect = (0, 0, 480, 300)
+        patch = paste(image, rect, self.rng.randbytes(480 * 300 * 2))
+        pieces = chunks(packet(1, rect, crop(patch, rect)))
+        self.send_spaced(2, pieces[:3], 2500)
+        self.board.advance(100)
+        self.board.step()
+        self.assertEqual(self.board.picture()[:2], b"\xf8\x00")
+        self.send_spaced(2, pieces[3:], 10)
+        self.assertEqual(set(self.board.new_events()), {"error,chunk_order_or_size"})
+        self.assertEqual(self.board.picture()[:2], b"\xf8\x00")
+
     def test_random_sequences_keep_every_picture_exact(self):
-        rng = self.rng
-        picture = view(rng)
-        next_id = presented = 1
-        self.show_live(presented, picture)
-        slots = {}
-        for _ in range(250):
-            action = rng.random()
-            if action < 0.35:
-                rect = FULL if rng.random() < 0.2 else random_rect(rng)
-                pixels = rng.randbytes(2) * (rect[2] * rect[3])
-                if rng.random() < 0.5:
-                    pixels = rng.randbytes(rect[2] * rect[3] * 2)
-                picture = paste(picture, rect, pixels)
-                base = 0 if rect == FULL else presented
-                next_id += 1
-                presented = next_id
-                self.show_live(presented, picture, base=base, rect=rect, codec=rng.randrange(2))
-            elif action < 0.55:
-                slot = rng.randrange(6)
-                if slot in slots and rng.random() < 0.5:
-                    rect = random_rect(rng)
-                    image = paste(slots[slot][1], rect, rng.randbytes(rect[2] * rect[3] * 2))
-                    base = slots[slot][0]
-                else:
-                    rect, image, base = FULL, view(rng, noise=rng.choice([0, 64, 160])), 0
-                next_id += 1
-                self.upload(
-                    slot,
-                    next_id,
-                    image,
-                    base=base,
-                    rect=rect,
-                    codec=rng.randrange(2),
-                    between=lambda: [self.board.step() for _ in range(rng.randrange(3))],
-                )
-                slots[slot] = (next_id, image)
-            elif action < 0.8:
-                slot = rng.randrange(6)
-                self.board.show_slot(slot, 3)
-                if slot in slots:
-                    presented, picture = slots[slot]
-                    self.assert_ack(self.board.new_events(), presented, 3)
-                else:
-                    self.assertEqual(self.board.new_events(), ["error,slot_unavailable"])
-            elif action < 0.85:
-                self.board.drop_slots()
-                slots = {}
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                board = Board(self.native)
+                try:
+                    RandomRun(self, board, random.Random(seed)).run(250)
+                finally:
+                    board.close()
+
+
+BLANK_PREFIX = b"\xf8\x00"
+
+
+class RandomRun:
+    """A model of the board driven alongside it: interleaved live and slot chunk streams,
+    corrupt and half-finished live frames, stalls, the offline blank, shows, and drops."""
+
+    def __init__(self, test, board, rng):
+        self.test, self.board, self.rng = test, board, rng
+        self.now = 0
+        self.next_id = 1
+        self.picture = view(rng)
+        self.board.live(1, packet(0, FULL, self.picture))
+        self.presented, self.presented_at = 1, 0
+        self.is_offline = self.is_blank_pending = False
+        self.live = None  # the board's current live stream, if any
+        self.upload = None  # the slot upload being sent
+        self.finalizing = None  # (slot, frame id, image) whose final chunk was sent
+        self.slots = {}
+        self.finals = 0
+
+    def new_id(self):
+        self.next_id += 1
+        return self.next_id
+
+    def advance(self, ms):
+        self.now += ms
+        self.board.advance(ms)
+
+    def is_writing(self):
+        live = self.live
+        return (
+            live is not None
+            and live["sent"] > 0
+            and live["is_valid"]
+            and not live["is_dead"]
+            and live["rect"][2] * live["rect"][3] * 2 > 4096
+        )
+
+    def blank(self):
+        if self.live and self.live["sent"]:
+            self.live["is_dead"] = True
+        self.is_blank_pending = False
+        picture = self.board.picture()
+        self.test.assertEqual(picture[:2], BLANK_PREFIX)
+        self.picture = picture
+
+    def step(self):
+        reports = self.board.slot_event_count()
+        is_busy = self.board.step()
+        if self.board.slot_event_count() > reports:
+            # A step that publishes a slot report does nothing else.
+            self.commit_slot()
+            return is_busy
+        if self.live and self.live["sent"] and self.now - self.live["last"] > 3000:
+            self.live["is_dead"] = True
+        if self.presented and not self.is_offline and self.now - self.presented_at > 7000:
+            self.presented, self.is_offline = 0, True
+            if self.is_writing() and self.live["base"] == 0:
+                self.is_blank_pending = True
             else:
-                for _ in range(rng.randrange(1, 60)):
-                    self.board.step()
-            self.assertEqual(self.board.picture(), picture)
-            self.assertEqual(self.board.presented_frame(), presented)
-            for slot, (slot_frame, image) in slots.items():
-                self.assertEqual(self.board.slot_frame(slot), slot_frame)
-                self.assertEqual(self.board.slot_pixels(slot), image)
+                self.blank()
+        if self.is_blank_pending and not self.is_writing():
+            self.blank()
+        self.commit_slot()
+        return is_busy
+
+    def commit_slot(self):
+        if self.finalizing and self.board.slot_frame(self.finalizing[0]) == self.finalizing[1]:
+            slot, frame_id, image = self.finalizing
+            self.slots[slot] = (frame_id, image)
+            self.finalizing = None
+
+    def start_live(self):
+        rng = self.rng
+        rect = FULL if rng.random() < 0.2 else random_rect(rng)
+        pixels = rng.randbytes(2) * (rect[2] * rect[3])
+        if rng.random() < 0.5:
+            pixels = rng.randbytes(rect[2] * rect[3] * 2)
+        base = 0 if rect == FULL else self.presented
+        data = packet(base, rect, pixels, rng.randrange(2))
+        is_corrupt = rng.random() < 0.1
+        if is_corrupt:
+            data = data[:-7]
+        self.live = {
+            "pieces": chunks(data),
+            "sent": 0,
+            "rect": rect,
+            "pixels": pixels,
+            "base": base,
+            "id": self.new_id(),
+            "is_corrupt": is_corrupt,
+            "is_valid": True,
+            "is_dead": False,
+            "is_orphan": False,
+            "last": self.now,
+        }
+
+    def send_live(self):
+        live = self.live
+        offset, is_final, piece = live["pieces"][live["sent"]]
+        if live["sent"] == 0:
+            if live["base"] == 0:
+                live["is_valid"] = live["rect"] == FULL
+            else:
+                live["is_valid"] = live["base"] == self.presented
+        self.board.frame_chunk(live["id"], 0, 4, offset, is_final, piece, len(piece))
+        live["sent"] += 1
+        live["last"] = self.now
+        if is_final:
+            if live["is_valid"] and not live["is_dead"] and not live["is_corrupt"]:
+                self.picture = paste(self.picture, live["rect"], live["pixels"])
+                self.presented, self.presented_at = live["id"], self.now
+                self.is_offline = self.is_blank_pending = False
+            self.live = None
+
+    def start_upload(self):
+        rng = self.rng
+        slot = rng.randrange(6)
+        if slot in self.slots and rng.random() < 0.5:
+            rect = random_rect(rng)
+            base, original = self.slots[slot]
+            image = paste(original, rect, rng.randbytes(rect[2] * rect[3] * 2))
+        else:
+            rect, image, base = FULL, view(rng, noise=rng.choice([0, 64, 200])), 0
+        frame_id = self.new_id()
+        data = packet(base, rect, crop(image, rect), rng.randrange(2))
+        self.upload = {
+            "slot": slot,
+            "id": frame_id,
+            "pieces": chunks(data),
+            "sent": 0,
+            "image": image,
+            "base": base,
+        }
+
+    def send_upload(self):
+        upload = self.upload
+        offset, is_final, piece = upload["pieces"][upload["sent"]]
+        if upload["sent"] == 0:
+            # The base must still be the slot's frame when the upload starts.
+            self.commit_slot()
+            base, slot = upload["base"], upload["slot"]
+            if base and self.slots.get(slot, (0,))[0] != base:
+                upload["is_dead"] = True
+            # A new upload finishes a pending final chunk, then empties its slot.
+            self.board.slot_chunk(
+                upload["slot"], upload["id"], 4, offset, is_final, piece, len(piece)
+            )
+            self.commit_slot()
+            self.slots.pop(upload["slot"], None)
+            if self.finalizing and self.finalizing[0] == upload["slot"]:
+                self.finalizing = None
+        else:
+            self.board.slot_chunk(
+                upload["slot"], upload["id"], 4, offset, is_final, piece, len(piece)
+            )
+        upload["sent"] += 1
+        if is_final:
+            self.finals += 1
+            if not upload.get("is_dead"):
+                self.finalizing = (upload["slot"], upload["id"], upload["image"])
+            self.upload = None
+        self.commit_slot()
+
+    def show(self):
+        slot = self.rng.randrange(6)
+        self.commit_slot()
+        pending = self.finalizing and self.finalizing[0] == slot
+        self.board.show_slot(slot, 3)
+        self.commit_slot()
+        if slot in self.slots:
+            self.presented, self.picture = self.slots[slot]
+            self.presented_at = self.now
+            self.is_offline = self.is_blank_pending = False
+            if self.live and self.live["sent"]:
+                self.live["is_dead"] = True
+        else:
+            self.test.assertFalse(pending)
+
+    def drop(self):
+        self.commit_slot()
+        if self.finalizing:
+            self.finalizing = None
+        self.board.drop_slots()
+        if self.upload and self.upload["sent"]:
+            self.upload["is_dead"] = True
+        self.slots = {}
+
+    def run(self, operations):
+        rng = self.rng
+        for _ in range(operations):
+            self.advance(rng.randrange(6))
+            action = rng.random()
+            is_live_free = self.live is None or self.live["is_orphan"] or self.live["is_dead"]
+            if is_live_free and action < 0.12:
+                self.start_live()
+            elif self.live and not self.live["is_orphan"] and action < 0.35:
+                if rng.random() < 0.03:
+                    self.live["is_orphan"] = True  # the sender gives up half way
+                else:
+                    self.send_live()
+            elif self.upload is None and action < 0.42:
+                self.start_upload()
+            elif self.upload is not None and action < 0.6:
+                self.send_upload()
+            elif action < 0.72:
+                self.show()
+            elif action < 0.75:
+                self.drop()
+            elif action < 0.77:
+                self.advance(3100)
+                self.step()
+            elif action < 0.79:
+                self.advance(7100)
+                self.step()
+            elif action < 0.84 and self.live and not self.live["is_orphan"]:
+                # A slow sender: the picture can go stale while a frame is still arriving.
+                self.advance(2500)
+                self.step()
+                if self.live and not self.live["is_dead"]:
+                    self.send_live()
+            else:
+                for _ in range(rng.randrange(1, 40)):
+                    self.step()
+            if self.live and self.live["is_dead"] and not self.is_writing():
+                # A dead stream is never sent again; its board state is gone.
+                self.live = None
+            self.check()
+        while self.upload is not None:
+            self.send_upload()
+        for _ in range(10000):
+            if not self.step():
+                break
+        self.check()
+        self.test.assertEqual(len(self.board.new_slot_events()), self.finals)
+
+    def check(self):
+        test, board = self.test, self.board
+        test.assertEqual(board.picture(), self.picture)
+        test.assertEqual(board.presented_frame(), self.presented)
+        test.assertEqual(board.visible_writes(), 0)
+        test.assertEqual(board.double_publishes(), 0)
+        test.assertEqual(board.untracked_differences(), 0)
+        for slot, (frame_id, image) in self.slots.items():
+            test.assertEqual(board.slot_frame(slot), frame_id)
+            test.assertEqual(board.slot_pixels(slot), image)
 
 
 if __name__ == "__main__":

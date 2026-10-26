@@ -126,6 +126,12 @@ text_sensor:
     entity_category: diagnostic
     disabled_by_default: true
   - platform: template
+    name: Display Slot Events
+    id: display_slot_events
+    update_interval: never
+    entity_category: diagnostic
+    disabled_by_default: true
+  - platform: template
     name: Display Timing
     id: display_timing
     update_interval: never
@@ -135,4 +141,5 @@ presto_display:
   id: presto_remote
   display_id: presto_lcd
   events_id: display_events
+  slot_events_id: display_slot_events
   timing_id: display_timing

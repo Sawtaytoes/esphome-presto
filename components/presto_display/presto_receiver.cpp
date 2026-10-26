@@ -278,6 +278,7 @@ void Receiver::frame_chunk(int frame_id, int touch_id, int format, int offset, b
     error_("chunk_order_or_size");
     return;
   }
+  last_chunk_at_ = panel_->millis();
   const size_t count = decode_base64_chunk(encoded, size, final_chunk, chunk_, sizeof(chunk_));
   if (!count) {
     error_("invalid_base64");
@@ -362,7 +363,7 @@ void Receiver::finish_live_(int frame_id, int touch_id) {
   const uint32_t draw_us = panel_->micros() - draw_started + (is_small_ ? 0 : sync_us_);
   presented_frame_ = frame_id;
   presented_at_ = panel_->millis();
-  is_offline_ = false;
+  is_offline_ = is_blank_pending_ = false;
   receiving_frame_ = 0;
   encoded_offset_ = header_have_ = 0;
   is_live_started_ = false;
@@ -395,22 +396,32 @@ void Receiver::slot_finish_() {
   const int slot = upload_.slot;
   const bool is_ok = upload_.status == SLOT_OK;
   slot_frames_[slot] = is_ok ? uint32_t(upload_.frame_id) : 0;
-  char event[64];
-  snprintf(event, sizeof(event), "slot,%d,%d,%d", slot, upload_.frame_id, upload_.status);
-  panel_->publish(event);
+  SlotReport &report = queue_slot_report_(slot, upload_.frame_id, upload_.status);
   if (is_ok) {
     // slot_timing,<slot>,<frame>,<rect bytes>,<decode us>,<PSRAM write us>,
     //             <first chunk to decoded ms>,<free PSRAM bytes>
-    char report[128];
-    snprintf(report, sizeof(report), "slot_timing,%d,%d,%lu,%lu,%lu,%lu,%lu", slot,
+    snprintf(report.timing, sizeof(report.timing), "slot_timing,%d,%d,%lu,%lu,%lu,%lu,%lu", slot,
              upload_.frame_id, static_cast<unsigned long>(slot_decoder_->header().rect.bytes()),
              static_cast<unsigned long>(upload_.decode_us),
              static_cast<unsigned long>(slot_writer_.us),
              static_cast<unsigned long>(panel_->millis() - upload_.first_chunk_at),
              static_cast<unsigned long>(panel_->free_psram()));
-    panel_->publish_timing(report);
   }
   slot_end_();
+}
+
+// Slot outcomes wait here and leave one per `step()`. ESPHome keeps only the newest state of
+// an entity that has not been sent yet, so two reports in one call could lose one.
+Receiver::SlotReport &Receiver::queue_slot_report_(int slot, int frame_id, int status) {
+  if (report_count_ == REPORT_CAPACITY) {
+    // Never expected (one report per final chunk); keep the newest.
+    report_first_ = (report_first_ + 1) % REPORT_CAPACITY;
+    --report_count_;
+  }
+  SlotReport &report = reports_[(report_first_ + report_count_++) % REPORT_CAPACITY];
+  snprintf(report.event, sizeof(report.event), "slot,%d,%d,%d", slot, frame_id, status);
+  report.timing[0] = '\0';
+  return report;
 }
 
 void Receiver::slot_error_(int slot, int frame_id, int status, bool final_chunk) {
@@ -430,9 +441,7 @@ void Receiver::slot_error_(int slot, int frame_id, int status, bool final_chunk)
     slot_frames_[slot] = 0;
   }
   if (final_chunk) {
-    char event[64];
-    snprintf(event, sizeof(event), "slot,%d,%d,%d", slot, frame_id, status);
-    panel_->publish(event);
+    queue_slot_report_(slot, frame_id, status);
   }
 }
 
@@ -567,7 +576,7 @@ void Receiver::show_slot(int slot, int touch_id) {
   const uint32_t draw_us = panel_->micros() - started;
   presented_frame_ = int(slot_frames_[slot]);
   presented_at_ = panel_->millis();
-  is_offline_ = false;
+  is_offline_ = is_blank_pending_ = false;
   char event[120];
   snprintf(event, sizeof(event), "frame,%d,%d,0,%lu,0,%lu", presented_frame_, touch_id,
            static_cast<unsigned long>(panel_->overruns()), static_cast<unsigned long>(draw_us));
@@ -591,17 +600,47 @@ void Receiver::drop_slots() {
 // ---------------------------------------------------------------------------------------
 // Idle work
 
+void Receiver::blank_() {
+  abandon_live_();
+  panel_->blank();
+  attach_();
+  // The blank was presented with a full copy: both own buffers hold it.
+  stale_[0] = stale_[1] = {};
+  is_settling_ = is_blank_pending_ = false;
+}
+
 bool Receiver::step() {
-  if (presented_frame_ && !is_offline_ && panel_->millis() - presented_at_ > OFFLINE_MS) {
-    // A stalled transfer must not finish into the buffer the blank is about to use.
+  if (report_count_) {
+    // At most one slot report per call, and nothing else alongside it.
+    const SlotReport &report = reports_[report_first_];
+    panel_->publish_slot(report.event);
+    if (report.timing[0]) {
+      panel_->publish_timing(report.timing);
+    }
+    report_first_ = (report_first_ + 1) % REPORT_CAPACITY;
+    --report_count_;
+    return true;
+  }
+  const uint32_t now = panel_->millis();
+  if (receiving_frame_ && now - last_chunk_at_ > STALL_MS) {
+    // A sender that stopped mid-frame must not hold back idle work or the offline blank.
     abandon_live_();
-    panel_->blank();
-    attach_();
-    // The blank was presented with a full copy: both own buffers hold it.
-    stale_[0] = stale_[1] = {};
-    is_settling_ = false;
+  }
+  if (presented_frame_ && !is_offline_ && now - presented_at_ > OFFLINE_MS) {
+    // Offline: touches stop and only a full frame is accepted, as before.
     presented_frame_ = 0;
     is_offline_ = true;
+    if (is_live_writing_() && header_.base == 0) {
+      // A full frame on its way keeps going, and the blank waits for it. The blank would
+      // have to draw into the buffer it is decoding into.
+      is_blank_pending_ = true;
+    } else {
+      blank_();
+    }
+  }
+  if (is_blank_pending_ && !is_live_writing_()) {
+    // The full frame failed or stalled before it could be shown.
+    blank_();
   }
   if (receiving_frame_) {
     // A live frame is between chunks; it has the PSRAM to itself.
@@ -620,7 +659,7 @@ bool Receiver::step() {
     check_panel_();
     settle_step_();
   }
-  return is_settling_ || (upload_.is_active && upload_.is_decoding);
+  return report_count_ || is_settling_ || (upload_.is_active && upload_.is_decoding);
 }
 
 } // namespace esphome::presto_display

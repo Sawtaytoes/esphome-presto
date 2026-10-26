@@ -43,7 +43,11 @@ class Panel : public PixelWriter {
   virtual void show(uint8_t *buffer) = 0;
   // Draw the offline marker and present it so both framebuffers hold it.
   virtual void blank() = 0;
+  // Display Events: frame acknowledgements, errors, touches, wake.
   virtual void publish(const char *event) = 0;
+  // Display Slot Events: `slot,...` only, so they never replace a queued acknowledgement.
+  virtual void publish_slot(const char *event) = 0;
+  // Display Timing (optional diagnostics).
   virtual void publish_timing(const char *report) = 0;
   virtual uint32_t micros() = 0;
   virtual uint32_t millis() = 0;
@@ -81,8 +85,16 @@ class Receiver {
   uint32_t slot_frame(int slot) const;
   bool is_settling() const { return is_settling_; }
   bool is_slot_visible() const { return slot_index_(front_) >= 0; }
+  // Where framebuffer `index` may differ from the picture; empty for the visible one.
+  Rect stale(int index) const { return stale_[index & 1]; }
+  // The rectangle a live frame is decoding into the back buffer now, or empty.
+  Rect live_rect() const { return is_live_writing_() ? header_.rect : Rect{}; }
+  int back_index() const { return back_; }
+  bool is_attached() const { return is_attached_; }
 
   static constexpr uint32_t OFFLINE_MS = 7000;
+  // A live frame with no new chunk for this long is abandoned.
+  static constexpr uint32_t STALL_MS = 3000;
   // Idle work per `step()`: framebuffer rows synchronized, or slot bytes decoded.
   static constexpr int SETTLE_ROWS = 16;
   static constexpr size_t SLOT_BUDGET = 16384;
@@ -116,6 +128,12 @@ class Receiver {
   void release_slot_();
 
   // Slots.
+  struct SlotReport {
+    char event[40];
+    char timing[112];
+  };
+  SlotReport &queue_slot_report_(int slot, int frame_id, int status);
+  void blank_();
   void slot_error_(int slot, int frame_id, int status, bool final_chunk);
   void slot_finish_();
   bool slot_run_(size_t budget);
@@ -148,7 +166,8 @@ class Receiver {
   int receiving_frame_{0}, receiving_touch_{0};
   int presented_frame_{0};
   uint32_t presented_at_{0};
-  bool is_offline_{false};
+  bool is_offline_{false}, is_blank_pending_{false};
+  uint32_t last_chunk_at_{0};
   uint32_t decode_us_{0}, sync_us_{0}, first_chunk_at_{0};
   size_t sync_bytes_{0};
 
@@ -167,6 +186,9 @@ class Receiver {
     size_t size{0}, used{0};
     uint32_t decode_us{0}, first_chunk_at{0};
   } upload_;
+  static constexpr int REPORT_CAPACITY = 2 * SLOT_COUNT;
+  SlotReport reports_[REPORT_CAPACITY];
+  int report_first_{0}, report_count_{0};
 };
 
 // Strict base64 for one chunk: groups of four, '=' padding only at the end of the final

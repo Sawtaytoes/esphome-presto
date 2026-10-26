@@ -81,7 +81,11 @@ the picture does not change. Only a complete frame is presented, at vertical
 blank, and acknowledged with `frame,<frame>,<touch>,0,<overruns>,<decode
 µs>,<draw µs>`. Unchanged heartbeat pixels acknowledge without a swap. Lost
 connections recover with a full frame. After seven seconds without a presented
-frame, the board shows an offline marker and disables touch.
+frame, the board disables touch, accepts only a full frame, and shows an offline
+marker. A full frame that is still arriving then keeps going and the marker waits
+for it; the marker appears only if that frame fails. A live frame that receives no
+chunk for three seconds is abandoned, so a sender that stops part way never holds
+back the offline marker or the idle work below.
 
 The second framebuffer is synchronized lazily: before a patch, only the area
 where it is stale and the patch does not cover is copied from the visible one. A
@@ -97,7 +101,7 @@ the likely next views ahead of time and show one instantly on a swipe:
   same packet and chunking as `frame_chunk`. The packet's base must be `0` with a
   full 480×480 rectangle, or the slot's current frame id (a patch against the
   slot). After the final chunk is decoded the board reports
-  `slot,<slot>,<frame_id>,<status>`: `0` is success; `1` a bad chunk or base64,
+  `slot,<slot>,<frame_id>,<status>` on Display Slot Events: `0` is success; `1` a bad chunk or base64,
   `2` a missing or out-of-order chunk, `3` a bad header, base, or body, `4` no
   such slot, and `5` dropped while decoding. Any nonzero status leaves the slot
   empty. An upload never changes the picture, decodes in bounded pieces between
@@ -117,6 +121,22 @@ pieces, then moves the scanout back onto a framebuffer holding the same picture.
 A live patch that arrives first still works: it copies only what it needs. An
 upload into the slot that is on screen first moves the scanout off it.
 
+**Events and entities.** ESPHome sends only the newest state of a text sensor that
+it has not sent yet, so when the link is slow an earlier state on the same entity
+is lost. The receiver therefore keeps each kind of report on its own entity, and
+no single action or loop step publishes two states on one entity:
+
+| Entity (example name) | Option | States |
+| --- | --- | --- |
+| Display Events | `events_id` (required) | `frame,…` and `error,…` acknowledgements, `touch,…`, `wake,…`, `wake_controls,…`, `controls,…` |
+| Display Slot Events | `slot_events_id` | `slot,<slot>,<frame_id>,<status>`, at most one per loop step |
+| Display Timing | `timing_id` | `timing,…`, `slot_timing,…`, `settled,…` |
+
+Without `slot_events_id`, slot uploads still work but report nothing, and CastKit
+needs those reports to use slots. Touch reads continue during long PSRAM copies
+inside an action, so a `touch,…` can still share a call with that action's
+acknowledgement on Display Events; the acknowledgement is published last.
+
 The slots take 2,764,800 bytes of the 8 MiB PSRAM, beside the two framebuffers
 (921,600 bytes). CastKit detects slot support by the presence of the `show_slot`
 action, so an older CastKit keeps working with this firmware.
@@ -126,8 +146,7 @@ The optional `timing_id` text sensor ("Display Timing" in the example) reports
 bytes>,<present µs>,<first to final chunk ms>,<free PSRAM bytes>` for each live
 frame, `slot_timing,<slot>,<frame>,<rect bytes>,<decode µs>,<PSRAM write µs>,<first
 chunk to decoded ms>,<free PSRAM bytes>` for each upload, and `settled,<bytes>,<µs>`
-when the framebuffers match the picture again after a slot was shown. It is its
-own entity, so a report can never replace a queued acknowledgement.
+when the framebuffers match the picture again after a slot was shown.
 
 The receiver's frame logic (`presto_receiver.cpp`, `presto_stream.cpp`) has no
 ESPHome or Pico types; `tests/test_receiver.py` and `tests/test_pixels.py`
