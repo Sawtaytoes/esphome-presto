@@ -77,6 +77,7 @@ void PrestoDisplay::setup() {
     delay(1);
   }
   drawing_buffer_ = 0;
+  front_ = framebuffers_[1];
   set_brightness(brightness_);
   ESP_LOGI(TAG, "480x480 RGB565, DMA-buffered scanout, PSRAM %u bytes",
            unsigned(rp2040.getPSRAMSize()));
@@ -107,9 +108,20 @@ void PrestoDisplay::update() {
 void PrestoDisplay::present(bool copy_previous) {
   driver_->set_framebuffer(framebuffers_[drawing_buffer_]);
   driver_->wait_for_vsync();
+  front_ = framebuffers_[drawing_buffer_];
   drawing_buffer_ ^= 1;
   if (copy_previous) {
     memcpy(framebuffers_[drawing_buffer_], framebuffers_[drawing_buffer_ ^ 1], 480 * 480 * 2);
+  }
+}
+void PrestoDisplay::show_buffer(uint16_t *buffer) {
+  driver_->set_framebuffer(buffer);
+  driver_->wait_for_vsync();
+  front_ = buffer;
+  if (buffer == framebuffers_[0]) {
+    drawing_buffer_ = 1;
+  } else if (buffer == framebuffers_[1]) {
+    drawing_buffer_ = 0;
   }
 }
 void PrestoDisplay::fill(Color color) {

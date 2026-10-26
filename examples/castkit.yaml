@@ -41,6 +41,25 @@ api:
         image_data: string
       then:
         - lambda: id(presto_remote).frame_chunk(frame_id, touch_id, format, offset, final_chunk, image_data);
+    - action: slot_chunk
+      variables:
+        slot: int
+        frame_id: int
+        format: int
+        offset: int
+        final_chunk: bool
+        image_data: string
+      then:
+        - lambda: id(presto_remote).slot_chunk(slot, frame_id, format, offset, final_chunk, image_data);
+    - action: show_slot
+      variables:
+        slot: int
+        touch_id: int
+      then:
+        - lambda: id(presto_remote).show_slot(slot, touch_id);
+    - action: drop_slots
+      then:
+        - lambda: id(presto_remote).drop_slots();
     - action: set_display_controls
       variables:
         revision: int
@@ -106,7 +125,14 @@ text_sensor:
     update_interval: never
     entity_category: diagnostic
     disabled_by_default: true
+  - platform: template
+    name: Display Timing
+    id: display_timing
+    update_interval: never
+    entity_category: diagnostic
+    disabled_by_default: true
 presto_display:
   id: presto_remote
   display_id: presto_lcd
   events_id: display_events
+  timing_id: display_timing

@@ -13,7 +13,9 @@ DMA reads are avoided because they can stall unrelated time-critical channels.
 with changing music artwork at native resolution. Static color patterns and touch
 during scanout also passed. Encrypted frame transfer and wireless OTA are verified.
 Gesture latency is still being tuned in CastKit's browser worker; this is not a
-claim that every application or workload has been validated.
+claim that every application or workload has been validated. The streaming
+receiver and frame slots compile for RP2350 with ESPHome 2026.10.0 and pass the
+host tests, but have not yet been measured on a panel.
 
 ## Try the hardware
 
@@ -63,17 +65,73 @@ coalesced. The firmware's light entities are internal in this example because
 CastKit supplies the user controls; the hardware example exposes native lights.
 
 Arduino gives the display core its own stack, separate from network/decode work.
-The receiver uses a SRAM input window and dictionary for large compressed images,
-then copies bounded chunks to PSRAM with scanout service gaps. Touch polling
-continues during these copies. Unchanged heartbeat pixels acknowledge without
-swapping framebuffers.
+Touch polling continues during every PSRAM copy, and each copy waits for the
+scanout's row prefetch, writes at most 960 bytes, then leaves the PSRAM bus idle
+for 50 µs (`PRESTO_WRITE_BATCH`, `PRESTO_PACE_US`). That pacing is what made
+native-resolution artwork steady; change it only with on-panel measurements.
 
-The receiver assembles bounded base64 chunks, validates the rectangle and its
-acknowledged base, and decompresses into a separate scratch buffer. Incomplete,
-out-of-order, corrupt or oversized frames do not reach the displayed buffer.
-Only a complete frame is presented and acknowledged. Lost connections recover
-with a full frame. After seven seconds without a presented frame, the board
-shows an offline marker and disables touch.
+### Live frames
+
+The receiver validates each bounded base64 chunk, its order, and the patch's
+rectangle and acknowledged base. It inflates every chunk as it arrives straight
+into the back framebuffer, through a 32 KiB SRAM dictionary allocated once, so
+there is no PSRAM staging copy. The visible buffer is never written: incomplete,
+out-of-order, corrupt, or oversized frames are rejected with `error,<reason>` and
+the picture does not change. Only a complete frame is presented, at vertical
+blank, and acknowledged with `frame,<frame>,<touch>,0,<overruns>,<decode
+µs>,<draw µs>`. Unchanged heartbeat pixels acknowledge without a swap. Lost
+connections recover with a full frame. After seven seconds without a presented
+frame, the board shows an offline marker and disables touch.
+
+The second framebuffer is synchronized lazily: before a patch, only the area
+where it is stale and the patch does not cover is copied from the visible one. A
+stream that redraws the same region (a clock, a camera) or a full-frame swipe
+copies nothing.
+
+### Frame slots
+
+Six slots (`0`–`5`) each hold a full 480×480 frame in PSRAM, so CastKit can send
+the likely next views ahead of time and show one instantly on a swipe:
+
+- `slot_chunk(slot, frame_id, format, offset, final_chunk, image_data)` uses the
+  same packet and chunking as `frame_chunk`. The packet's base must be `0` with a
+  full 480×480 rectangle, or the slot's current frame id (a patch against the
+  slot). After the final chunk is decoded the board reports
+  `slot,<slot>,<frame_id>,<status>`: `0` is success; `1` a bad chunk or base64,
+  `2` a missing or out-of-order chunk, `3` a bad header, base, or body, `4` no
+  such slot, and `5` dropped while decoding. Any nonzero status leaves the slot
+  empty. An upload never changes the picture, decodes in bounded pieces between
+  live frames, and keeps its place when a live frame arrives in the middle of it.
+  One upload runs at a time; starting another abandons the unfinished one.
+- `show_slot(slot, touch_id)` scans the slot out from the next vertical blank
+  (a pointer swap, no copy) and acknowledges like a live frame, with the slot's
+  frame id: `frame,<slot frame>,<touch>,0,<overruns>,0,<draw µs>`. The next live
+  patch uses that frame as its base. An empty, unfinished, or unknown slot answers
+  `error,slot_unavailable` and the picture does not change. A slot keeps its
+  content after it is shown, so swiping back and forth shows it again.
+- `drop_slots()` empties every slot. CastKit calls it when it connects, so a slot
+  from an earlier session is never shown.
+
+After a slot is shown, idle time copies it into both framebuffers in bounded
+pieces, then moves the scanout back onto a framebuffer holding the same picture.
+A live patch that arrives first still works: it copies only what it needs. An
+upload into the slot that is on screen first moves the scanout off it.
+
+The slots take 2,764,800 bytes of the 8 MiB PSRAM, beside the two framebuffers
+(921,600 bytes). CastKit detects slot support by the presence of the `show_slot`
+action, so an older CastKit keeps working with this firmware.
+
+The optional `timing_id` text sensor ("Display Timing" in the example) reports
+`timing,<frame>,<rect bytes>,<decode µs>,<PSRAM write µs>,<sync µs>,<sync
+bytes>,<present µs>,<first to final chunk ms>,<free PSRAM bytes>` for each live
+frame, `slot_timing,<slot>,<frame>,<rect bytes>,<decode µs>,<PSRAM write µs>,<first
+chunk to decoded ms>,<free PSRAM bytes>` for each upload, and `settled,<bytes>,<µs>`
+when the framebuffers match the picture again after a slot was shown. It is its
+own entity, so a report can never replace a queued acknowledgement.
+
+The receiver's frame logic (`presto_receiver.cpp`, `presto_stream.cpp`) has no
+ESPHome or Pico types; `tests/test_receiver.py` and `tests/test_pixels.py`
+compile and drive that exact code on the host.
 
 At zero backlight brightness the panel is dark but still listens for a press.
 The first press lights it at the wake level CastKit sends through
@@ -94,8 +152,8 @@ esphome compile examples/hardware-test.yaml
 esphome compile examples/castkit.yaml
 ```
 
-The decoder tests compile and execute the actual C++/miniz decoder on the host;
-they require `g++`. CI compiles all three firmware examples and checks the
+The receiver and decoder tests compile and execute the actual C++/miniz code on
+the host; they require `g++`. CI compiles all three firmware examples and checks the
 project's Python and C++ formatting. Vendored code retains upstream formatting.
 See [UPSTREAM.md](UPSTREAM.md) for licenses, pinned sources and adaptations.
 

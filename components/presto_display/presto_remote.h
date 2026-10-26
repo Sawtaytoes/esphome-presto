@@ -2,22 +2,33 @@
 #include "esphome/core/defines.h"
 #ifdef USE_PRESTO_REMOTE
 #include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/string_ref.h"
 #include "esphome/components/text_sensor/text_sensor.h"
-#include "miniz_tinfl.h"
+#include "presto_receiver.h"
 #include "presto_wake.h"
 #include <cstdint>
 #include <functional>
 namespace esphome::presto_display {
 class PrestoDisplay;
-class PrestoRemote : public Component {
+// ESPHome side of the CastKit receiver: API actions, touch and wake, and the board's
+// PSRAM access rules. The frame logic is `Receiver`.
+class PrestoRemote : public Component, public Panel {
  public:
+  PrestoRemote() : receiver_(this) {}
   void setup() override;
   void loop() override;
   void set_display(PrestoDisplay *display) { display_ = display; }
   void set_events(text_sensor::TextSensor *events) { events_ = events; }
+  // Optional diagnostic sensor. A separate entity, so a timing report can never replace a
+  // queued acknowledgement in ESPHome's one-state-per-entity send buffer.
+  void set_timing(text_sensor::TextSensor *timing) { timing_ = timing; }
   void frame_chunk(int frame_id, int touch_id, int format, int offset, bool final_chunk,
                    const StringRef &encoded);
+  void slot_chunk(int slot, int frame_id, int format, int offset, bool final_chunk,
+                  const StringRef &encoded);
+  void show_slot(int slot, int touch_id);
+  void drop_slots();
   void touch(int phase, int x, int y);
   void controls_ack(int revision, int backlight);
   // CastKit's commanded level. Zero is dark, but a press still lights the panel at the wake level.
@@ -27,21 +38,31 @@ class PrestoRemote : public Component {
   void poll_touch();
   void wait_for_prefetch();
 
+  // Panel
+  void write(uint8_t *to, const uint8_t *from, size_t size) override;
+  void read(uint8_t *to, const uint8_t *from, size_t size) override;
+  uint8_t *framebuffer(int index) override;
+  uint8_t *visible() override;
+  void show(uint8_t *buffer) override;
+  void blank() override;
+  void publish(const char *event) override;
+  void publish_timing(const char *report) override;
+  uint32_t micros() override;
+  uint32_t millis() override;
+  uint32_t overruns() override;
+  size_t free_psram() override;
+
  protected:
-  void error_(const char *reason);
+  bool is_ready_();
   void apply_brightness_();
-  bool decode_packet_();
   PrestoDisplay *display_{nullptr};
-  text_sensor::TextSensor *events_{nullptr};
-  uint8_t *packet_{nullptr}, *patch_{nullptr};
-  uint8_t chunk_buffer_[3000];
-  tinfl_decompressor *inflater_{nullptr};
-  size_t received_{0}, encoded_offset_{0};
-  int receiving_frame_{0}, receiving_touch_{0}, presented_frame_{0}, sequence_{0};
-  uint32_t presented_at_{0}, last_touch_poll_{0};
+  text_sensor::TextSensor *events_{nullptr}, *timing_{nullptr};
+  Receiver receiver_;
+  HighFrequencyLoopRequester high_frequency_;
+  uint32_t last_touch_poll_{0};
   std::function<void()> touch_poller_;
-  bool offline_{false};
   WakeLatch wake_;
+  int sequence_{0};
   int last_x_{0}, last_y_{0};
 };
 } // namespace esphome::presto_display

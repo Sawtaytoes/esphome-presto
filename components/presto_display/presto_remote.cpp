@@ -2,150 +2,103 @@
 #ifdef USE_PRESTO_REMOTE
 #include "presto_display.h"
 #include "presto_remote.h"
-#include "presto_pixels.h"
-#include "esphome/core/helpers.h"
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include "pico/time.h"
+
+// PSRAM write pacing. Production values: wait for the scanout's row prefetch, write at most
+// 960 bytes, then leave the QMI idle for 50 us. They are what made native-resolution
+// music artwork steady; change them only with on-panel measurements.
+#ifndef PRESTO_WRITE_BATCH
+#define PRESTO_WRITE_BATCH 960
+#endif
+#ifndef PRESTO_PACE_US
+#define PRESTO_PACE_US 50
+#endif
+
 namespace esphome::presto_display {
-static constexpr size_t FRAME_BYTES = 480 * 480 * 2;
-static constexpr size_t PACKET_BYTES = 500000;
-static PrestoRemote *active_receiver = nullptr;
-static void copy_pixels_paced(uint8_t *to, const uint8_t *from, size_t size) {
-  alignas(4) uint8_t row[960];
-  while (size) {
-    const size_t count = std::min(size, sizeof(row));
-    if (active_receiver) {
-      active_receiver->wait_for_prefetch();
-    }
-    memcpy(row, from, count);
-    if (active_receiver) {
-      active_receiver->wait_for_prefetch();
-    }
-    memcpy(to, row, count);
-    from += count;
-    to += count;
-    size -= count;
-    // Give the lower-priority XIP streaming hardware a QMI service window.
-    sleep_us(50);
-    if (active_receiver) {
-      active_receiver->poll_touch();
-    }
-  }
-}
-static uint16_t read16(const uint8_t *p) {
-  return uint16_t(p[0]) << 8 | p[1];
-}
+static const char *const TAG = "presto_remote";
+
 void PrestoRemote::setup() {
-  packet_ = static_cast<uint8_t *>(pmalloc(PACKET_BYTES));
-  patch_ = static_cast<uint8_t *>(pmalloc(FRAME_BYTES));
-  // miniz's state is too large for the RP2 loop stack; allocate it once.
-  inflater_ = new tinfl_decompressor;
-  if (!packet_ || !patch_ || !inflater_) {
+  if (!receiver_.begin()) {
+    ESP_LOGE(TAG, "Could not allocate the inflate state");
     mark_failed();
+    return;
   }
+  // Frame slots live in PSRAM for the life of the firmware; drop_slots only empties them.
+  // A slot that could not be allocated answers every upload with SLOT_UNAVAILABLE.
+  uint8_t *slots[SLOT_COUNT];
+  int count = 0;
+  while (count < SLOT_COUNT && (slots[count] = static_cast<uint8_t *>(pmalloc(FRAME_BYTES)))) {
+    ++count;
+  }
+  if (count < SLOT_COUNT) {
+    ESP_LOGW(TAG, "PSRAM for %d of %d frame slots", count, SLOT_COUNT);
+  }
+  receiver_.set_slots(slots, count);
+  ESP_LOGI(TAG, "%d frame slots, %u bytes of PSRAM free", count,
+           unsigned(rp2040.getFreePSRAMHeap()));
 }
-void PrestoRemote::error_(const char *reason) {
-  receiving_frame_ = 0;
-  received_ = encoded_offset_ = 0;
-  events_->publish_state(std::string("error,") + reason);
+
+bool PrestoRemote::is_ready_() {
+  return !is_failed() && !display_->is_failed();
 }
+
 void PrestoRemote::frame_chunk(int frame_id, int touch_id, int format, int offset, bool final_chunk,
                                const StringRef &encoded) {
-  if (is_failed() || frame_id <= 0 || touch_id < 0 || format != 4 || offset < 0 ||
-      encoded.size() == 0 || encoded.size() > 4000 || encoded.size() % 4) {
-    error_("invalid_chunk");
+  if (!is_ready_()) {
+    publish("error,invalid_chunk");
     return;
   }
-  if (!offset) {
-    receiving_frame_ = frame_id;
-    receiving_touch_ = touch_id;
-    received_ = encoded_offset_ = 0;
-  }
-  if (frame_id != receiving_frame_ || touch_id != receiving_touch_ ||
-      size_t(offset) != encoded_offset_ || received_ + encoded.size() / 4 * 3 > PACKET_BYTES) {
-    error_("chunk_order_or_size");
-    return;
-  }
-  for (size_t i = 0; i < encoded.size(); ++i) {
-    const char c = encoded[i];
-    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' ||
-          c == '/' || (c == '=' && final_chunk && i >= encoded.size() - 2))) {
-      error_("invalid_base64");
-      return;
-    }
-  }
-  const size_t count = base64_decode(reinterpret_cast<const uint8_t *>(encoded.c_str()),
-                                     encoded.size(), chunk_buffer_, sizeof(chunk_buffer_));
-  if (!count) {
-    error_("invalid_base64");
-    return;
-  }
-  active_receiver = this;
-  copy_pixels_paced(packet_ + received_, chunk_buffer_, count);
-  received_ += count;
-  encoded_offset_ += encoded.size();
-  if (!final_chunk) {
-    return;
-  }
-  active_receiver = this;
-  const uint32_t started = micros();
-  if (!decode_packet_()) {
-    error_("invalid_packet_or_base");
-    return;
-  }
-  const uint32_t decoded_at = micros();
-  const uint16_t x = read16(packet_ + 4), y = read16(packet_ + 6);
-  const uint16_t width = read16(packet_ + 8), height = read16(packet_ + 10);
-  auto *back = reinterpret_cast<uint8_t *>(display_->get_framebuffer());
-  bool changed = false;
-  for (size_t row = 0; row < height; ++row) {
-    display_->wait_for_prefetch();
-    if (memcmp(back + ((y + row) * 480 + x) * 2, patch_ + row * width * 2, width * 2)) {
-      changed = true;
-      break;
-    }
-  }
-  if (changed) {
-    for (size_t row = 0; row < height; ++row) {
-      copy_pixels_paced(back + ((y + row) * 480 + x) * 2, patch_ + row * width * 2, width * 2);
-    }
-    display_->present(false);
-    back = reinterpret_cast<uint8_t *>(display_->get_framebuffer());
-    for (size_t row = 0; row < height; ++row) {
-      copy_pixels_paced(back + ((y + row) * 480 + x) * 2, patch_ + row * width * 2, width * 2);
-    }
-  }
-  const uint32_t draw_us = micros() - decoded_at;
-  presented_frame_ = frame_id;
-  presented_at_ = millis();
-  offline_ = false;
-  receiving_frame_ = 0;
-  received_ = encoded_offset_ = 0;
-  char event[120];
-  snprintf(event, sizeof(event), "frame,%d,%d,0,%lu,%lu,%lu", frame_id, touch_id,
-           static_cast<unsigned long>(display_->get_prefetch_overruns()),
-           static_cast<unsigned long>(decoded_at - started), static_cast<unsigned long>(draw_us));
-  events_->publish_state(event);
+  receiver_.frame_chunk(frame_id, touch_id, format, offset, final_chunk, encoded.c_str(),
+                        encoded.size());
 }
-bool PrestoRemote::decode_packet_() {
-  return decode_pixels(packet_, received_, presented_frame_, patch_, inflater_, copy_pixels_paced);
+
+void PrestoRemote::slot_chunk(int slot, int frame_id, int format, int offset, bool final_chunk,
+                              const StringRef &encoded) {
+  if (!is_ready_()) {
+    if (final_chunk) {
+      char event[64];
+      snprintf(event, sizeof(event), "slot,%d,%d,%d", slot, frame_id, int(SLOT_UNAVAILABLE));
+      publish(event);
+    }
+    return;
+  }
+  receiver_.slot_chunk(slot, frame_id, format, offset, final_chunk, encoded.c_str(),
+                       encoded.size());
 }
+
+void PrestoRemote::show_slot(int slot, int touch_id) {
+  if (!is_ready_()) {
+    publish("error,slot_unavailable");
+    return;
+  }
+  receiver_.show_slot(slot, touch_id);
+}
+
+void PrestoRemote::drop_slots() {
+  if (is_ready_()) {
+    receiver_.drop_slots();
+  }
+}
+
 void PrestoRemote::touch(int phase, int x, int y) {
   if (phase < 0 || phase > 2 || x < 0 || x >= 480 || y < 0 || y >= 480) {
     return;
   }
   // The latch sees every contact, including releases while offline, so a swallowed press always
   // reaches its release.
-  const TouchAction action = wake_.touch(phase, millis());
+  const TouchAction action = wake_.touch(phase, esphome::millis());
   if (action == TouchAction::WAKE) {
     apply_brightness_();
-    events_->publish_state("wake,1");
+    publish("wake,1");
     return;
   }
-  if (action == TouchAction::DROP || !presented_frame_ || millis() - presented_at_ > 7000) {
+  const int shown = receiver_.touch_frame();
+  if (action == TouchAction::DROP || !shown) {
     return;
   }
   if (phase == 2) {
@@ -156,51 +109,135 @@ void PrestoRemote::touch(int phase, int x, int y) {
     last_y_ = y;
   }
   char event[100];
-  snprintf(event, sizeof(event), "touch,%d,%d,%d,%d,0,%d,0", ++sequence_, phase, x, y,
-           presented_frame_);
-  events_->publish_state(event);
+  snprintf(event, sizeof(event), "touch,%d,%d,%d,%d,0,%d,0", ++sequence_, phase, x, y, shown);
+  publish(event);
 }
+
 void __not_in_flash_func(PrestoRemote::wait_for_prefetch)() {
   display_->wait_for_prefetch();
 }
+
 void PrestoRemote::poll_touch() {
-  if (touch_poller_ && millis() - last_touch_poll_ >= 20) {
-    last_touch_poll_ = millis();
+  if (touch_poller_ && esphome::millis() - last_touch_poll_ >= 20) {
+    last_touch_poll_ = esphome::millis();
     touch_poller_();
   }
 }
+
 void PrestoRemote::apply_brightness_() {
   display_->set_brightness(wake_.brightness() / 100.0f);
 }
+
 void PrestoRemote::set_backlight(int percent) {
   wake_.set_backlight(percent);
   apply_brightness_();
 }
+
 void PrestoRemote::set_wake(int percent, int seconds) {
   wake_.set_wake(percent, seconds);
   apply_brightness_();
   char event[48];
   snprintf(event, sizeof(event), "wake_controls,%d,%d", percent, seconds);
-  events_->publish_state(event);
+  publish(event);
 }
+
 void PrestoRemote::controls_ack(int revision, int backlight) {
   char event[64];
   snprintf(event, sizeof(event), "controls,%d,%d", revision, backlight);
-  events_->publish_state(event);
+  publish(event);
 }
+
 void PrestoRemote::loop() {
-  if (wake_.expire(millis())) {
+  if (wake_.expire(esphome::millis())) {
     apply_brightness_();
-    events_->publish_state("wake,0");
+    publish("wake,0");
   }
-  if (!presented_frame_ || offline_ || millis() - presented_at_ <= 7000) {
+  if (!is_ready_()) {
     return;
   }
+  // Idle work (the offline blank, slot decoding, framebuffer sync) in bounded pieces; keep
+  // the loop running continuously while some is queued.
+  if (receiver_.step()) {
+    high_frequency_.start();
+  } else {
+    high_frequency_.stop();
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// Panel
+
+// SRAM -> PSRAM, behind the scanout prefetch gate, paced.
+void PrestoRemote::write(uint8_t *to, const uint8_t *from, size_t size) {
+  while (size) {
+    const size_t count = std::min(size, size_t(PRESTO_WRITE_BATCH));
+    display_->wait_for_prefetch();
+    memcpy(to, from, count);
+    to += count;
+    from += count;
+    size -= count;
+#if PRESTO_PACE_US > 0
+    // Give the lower-priority XIP streaming hardware a QMI service window.
+    sleep_us(PRESTO_PACE_US);
+#endif
+    poll_touch();
+  }
+}
+
+// PSRAM -> SRAM, behind the scanout prefetch gate.
+void PrestoRemote::read(uint8_t *to, const uint8_t *from, size_t size) {
+  while (size) {
+    const size_t count = std::min(size, size_t(PRESTO_WRITE_BATCH));
+    display_->wait_for_prefetch();
+    memcpy(to, from, count);
+    to += count;
+    from += count;
+    size -= count;
+  }
+}
+
+uint8_t *PrestoRemote::framebuffer(int index) {
+  return reinterpret_cast<uint8_t *>(display_->get_framebuffer(index));
+}
+
+uint8_t *PrestoRemote::visible() {
+  return reinterpret_cast<uint8_t *>(display_->get_front_framebuffer());
+}
+
+void PrestoRemote::show(uint8_t *buffer) {
+  display_->show_buffer(reinterpret_cast<uint16_t *>(buffer));
+}
+
+void PrestoRemote::blank() {
   display_->fill(Color(0, 0, 0));
   display_->filled_rectangle(0, 0, 480, 4, Color(255, 0, 0));
   display_->present();
-  presented_frame_ = 0;
-  offline_ = true;
+}
+
+void PrestoRemote::publish(const char *event) {
+  events_->publish_state(event);
+}
+
+void PrestoRemote::publish_timing(const char *report) {
+  if (timing_) {
+    timing_->publish_state(report);
+  }
+}
+
+uint32_t PrestoRemote::micros() {
+  return esphome::micros();
+}
+
+uint32_t PrestoRemote::millis() {
+  return esphome::millis();
+}
+
+uint32_t PrestoRemote::overruns() {
+  return display_->get_prefetch_overruns();
+}
+
+size_t PrestoRemote::free_psram() {
+  return rp2040.getFreePSRAMHeap();
 }
 } // namespace esphome::presto_display
 #endif

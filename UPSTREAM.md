@@ -20,10 +20,12 @@ in eight-row batches. Timing words run from a cyclic SRAM
 DMA table; pixel DMA follows a SRAM row-address table rather than an IRQ-updated
 pointer. Frame swaps occur at vertical blank. Pixel DMA reads buffered rows.
 The display core has a separate Arduino stack and no SysTick; display and DMA
-receive bus priority. The inflater runs from RAM on RP2, reads through a 4 KiB
-SRAM input window and writes through its 32 KiB SRAM dictionary. PSRAM copies
-wait for outstanding row fetches and yield in row-sized chunks; base64 first
-decodes into SRAM. Unchanged heartbeat pixels do not swap buffers.
+receive bus priority. The inflater runs from RAM on RP2 and writes through its
+32 KiB SRAM dictionary; each base64 chunk decodes into SRAM and is inflated as it
+arrives straight into the back framebuffer or a frame slot. PSRAM copies wait for
+outstanding row fetches and yield in row-sized chunks. Unchanged heartbeat pixels
+do not swap buffers. The scanout may also read a frame slot directly; the swap is
+the same vertical-blank pointer swap.
 Touch polling remains active during the paced copies.
 The enlarged 240×240 workaround is not accepted for production sharpness.
 Direct PSRAM DMA is avoided: QMI bus stalls also stall SRAM DMA channels.

@@ -1,4 +1,4 @@
-"""Exercise the actual C++ decoder without a board or ESPHome runtime."""
+"""Exercise the actual C++ streaming decoder without a board or ESPHome runtime."""
 
 import ctypes
 import pathlib
@@ -16,11 +16,49 @@ class PixelDecoderTests(unittest.TestCase):
         cls.scratch = tempfile.TemporaryDirectory()
         root = pathlib.Path(__file__).resolve().parents[1] / "components" / "presto_display"
         wrapper = pathlib.Path(cls.scratch.name) / "wrapper.cpp"
-        wrapper.write_text("""#include "presto_pixels.h"
+        wrapper.write_text("""#include "presto_stream.h"
+#include <cstring>
+#include <random>
+using namespace esphome::presto_display;
+struct Memory : PixelWriter {
+  void write(uint8_t *to, const uint8_t *from, size_t size) override { memcpy(to, from, size); }
+};
+// Decode a whole packet into a compact width x height buffer, feeding the body in random
+// chunks of 1..max_chunk bytes with an output budget per call (SIZE_MAX for none).
+extern "C" bool decode_chunked(const unsigned char *packet, size_t size, unsigned base,
+                               unsigned char *output, size_t max_chunk, size_t budget,
+                               unsigned seed) {
+  static tinfl_decompressor inflater;
+  static uint8_t dictionary[TINFL_LZ_DICT_SIZE];
+  Memory memory;
+  StreamDecoder decoder(&inflater, dictionary, &memory);
+  PatchHeader header;
+  if (size < HEADER_BYTES || !parse_header(packet, base, header)) {
+    return false;
+  }
+  decoder.begin(header, output, header.rect.width);
+  std::mt19937 rng(seed);
+  size_t offset = HEADER_BYTES;
+  auto status = StreamDecoder::Status::NEED_INPUT;
+  while (offset < size) {
+    const size_t count = std::min(size - offset, size_t(1 + rng() % max_chunk));
+    const bool is_last = offset + count == size;
+    size_t used = 0;
+    do {
+      size_t consumed = 0;
+      status = decoder.feed(packet + offset + used, count - used, is_last, consumed, budget);
+      used += consumed;
+    } while (status == StreamDecoder::Status::MORE);
+    if (status == StreamDecoder::Status::FAILED) {
+      return false;
+    }
+    offset += count;
+  }
+  return status == StreamDecoder::Status::COMPLETE;
+}
 extern "C" bool decode(const unsigned char *packet, size_t size, unsigned base,
                        unsigned char *output) {
-  tinfl_decompressor inflater;
-  return esphome::presto_display::decode_pixels(packet, size, base, output, &inflater);
+  return decode_chunked(packet, size, base, output, size, SIZE_MAX, 1);
 }
 """)
         library = pathlib.Path(cls.scratch.name) / "pixels.so"
@@ -34,16 +72,28 @@ extern "C" bool decode(const unsigned char *packet, size_t size, unsigned base,
                 "-I",
                 str(root),
                 str(wrapper),
-                str(root / "presto_pixels.cpp"),
+                str(root / "presto_stream.cpp"),
                 str(root / "miniz_tinfl.c"),
                 "-o",
                 str(library),
             ],
             check=True,
         )
-        cls.decode = ctypes.CDLL(str(library)).decode
+        native = ctypes.CDLL(str(library))
+        cls.decode = native.decode
         cls.decode.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p]
         cls.decode.restype = ctypes.c_bool
+        cls.decode_chunked = native.decode_chunked
+        cls.decode_chunked.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+        ]
+        cls.decode_chunked.restype = ctypes.c_bool
 
     @classmethod
     def tearDownClass(cls):
@@ -141,9 +191,60 @@ extern "C" bool decode(const unsigned char *packet, size_t size, unsigned base,
             with self.subTest(body=invalid):
                 self.assertFalse(self.decoded(self.packet(invalid, codec=1))[0])
 
+    def chunked(self, packet, max_chunk, budget, seed, base=7):
+        output = ctypes.create_string_buffer(b"\xaa" * (480 * 480 * 2 + 16))
+        accepted = self.decode_chunked(
+            packet, len(packet), base, output, max_chunk, budget or (2**64 - 1), seed
+        )
+        self.assertEqual(output.raw[480 * 480 * 2 :][:16], b"\xaa" * 16)
+        return accepted, output.raw
+
+    def test_any_chunking_and_budget_gives_the_same_pixels(self):
+        # Chunks of up to 3,000 B are what the receiver sees; 7-byte chunks straddle every
+        # RLE control word and run value; a small budget splits every chunk's output.
+        rng = random.Random(7)
+        pixels = bytearray(b"\x12\x34" * (480 * 480))
+        for _ in range(40):
+            start = rng.randrange(0, len(pixels) - 2000, 2)
+            pixels[start : start + 2000] = rng.randbytes(2000)
+        pixels = bytes(pixels)
+        rle = rle_encode(pixels)
+        for codec, body in [(0, zlib.compress(pixels)), (1, rle)]:
+            packet = self.packet(body, base=0, x=0, y=0, width=480, height=480, codec=codec)
+            for max_chunk, budget in [(3000, 0), (7, 0), (3000, 1), (3000, 5000), (911, 960)]:
+                with self.subTest(codec=codec, max_chunk=max_chunk, budget=budget):
+                    accepted, output = self.chunked(packet, max_chunk, budget, max_chunk + budget)
+                    self.assertTrue(accepted)
+                    self.assertEqual(output[: len(pixels)], pixels)
+                    self.assertFalse(self.chunked(packet[:-1], max_chunk, budget, 3)[0])
+                    self.assertFalse(self.chunked(packet + b"\0\0", max_chunk, budget, 3)[0])
+
     def test_rejects_missing_header(self):
         for size in range(14):
             self.assertFalse(self.decoded(bytes(size))[0])
+
+
+def rle_encode(pixels):
+    """CastKit's RLE: little-endian control words; bit 15 repeats one pixel."""
+    out = bytearray()
+    words = [pixels[i : i + 2] for i in range(0, len(pixels), 2)]
+    i = 0
+    while i < len(words):
+        run = 1
+        while i + run < len(words) and run < 0x8000 and words[i + run] == words[i]:
+            run += 1
+        if run > 1:
+            out += struct.pack("<H", 0x8000 | (run - 1)) + words[i]
+            i += run
+            continue
+        start = i
+        while i < len(words) and i - start < 0x8000:
+            if i + 1 < len(words) and words[i + 1] == words[i]:
+                break
+            i += 1
+        i = max(i, start + 1)
+        out += struct.pack("<H", i - start - 1) + b"".join(words[start:i])
+    return bytes(out)
 
 
 if __name__ == "__main__":

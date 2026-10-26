@@ -19,13 +19,22 @@ class PrestoDisplay : public display::DisplayBuffer {
     return display::DisplayType::DISPLAY_TYPE_COLOR;
   }
   void set_brightness(float brightness);
+  // The framebuffer drawing goes into; never the visible one.
   uint16_t *get_framebuffer() { return framebuffers_[drawing_buffer_]; }
+  // One of the two framebuffers, by index.
+  uint16_t *get_framebuffer(int index) { return framebuffers_[index & 1]; }
+  // The buffer the scanout reads now: a framebuffer, or a buffer passed to show_buffer().
+  uint16_t *get_front_framebuffer() { return front_; }
   void present(bool copy_previous = true);
+  // Scan out any full 480x480 RGB565 buffer in PSRAM from the next vertical blank, and
+  // return once it is visible. Showing one of the framebuffers makes drawing use the other.
+  void show_buffer(uint16_t *buffer);
   uint32_t get_prefetch_overruns() const { return driver_->get_prefetch_overruns(); }
 
  protected:
   void draw_absolute_pixel_internal(int x, int y, Color color) override;
   uint16_t *framebuffers_[2] = {nullptr, nullptr};
+  uint16_t *front_{nullptr};
   pimoroni::ST7701 *driver_{nullptr};
   uint8_t drawing_buffer_{0};
   float brightness_{0.02f};
