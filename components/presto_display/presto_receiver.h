@@ -6,10 +6,12 @@
 // Buffers. The display owns two framebuffers; the receiver may also show a frame slot.
 // `front_` is what the scanout reads. Live patches always decode into `own_[back_]`, never
 // into the visible buffer and never into a slot. `stale_[i]` bounds where `own_[i]` may
-// differ from the visible picture, so before a patch only `stale - patch` is copied from
-// the front (lazy sync). Showing a slot is a pointer swap at vertical blank; both own
-// buffers are then stale everywhere, and idle time copies the slot into them, swaps the
-// panel back onto an own buffer with the same picture (so the slot is free to be
+// differ from the visible picture. Idle time copies the stale area of the back buffer from
+// the front in small paced steps (idle sync), starting SYNC_DELAY_MS after the last live
+// chunk so a continuous stream is not slowed; a patch that arrives first copies only
+// `stale - patch` (lazy sync). Showing a slot is a pointer swap at vertical blank; both own
+// buffers are then stale everywhere, and idle time copies the slot into them at once, swaps
+// the panel back onto an own buffer with the same picture (so the slot is free to be
 // rewritten), and stops once both own buffers match the picture again.
 #include <cstddef>
 #include <cstdint>
@@ -83,7 +85,8 @@ class Receiver {
   int presented_frame() const { return presented_frame_; }
   // Test and diagnostic views.
   uint32_t slot_frame(int slot) const;
-  bool is_settling() const { return is_settling_; }
+  // True while idle sync has work left: a stale back buffer, or a slot on screen.
+  bool is_settling() const { return needs_sync_(); }
   bool is_slot_visible() const { return slot_index_(front_) >= 0; }
   // Where framebuffer `index` may differ from the picture; empty for the visible one.
   Rect stale(int index) const { return stale_[index & 1]; }
@@ -93,6 +96,8 @@ class Receiver {
   bool is_attached() const { return is_attached_; }
 
   static constexpr uint32_t OFFLINE_MS = 7000;
+  // Idle sync after a live frame waits this long after the last live chunk.
+  static constexpr uint32_t SYNC_DELAY_MS = 150;
   // A live frame with no new chunk for this long is abandoned.
   static constexpr uint32_t STALL_MS = 3000;
   // Idle work per `step()`: framebuffer rows synchronized, or slot bytes decoded.
@@ -124,6 +129,7 @@ class Receiver {
   void present_back_(const Rect &drawn);
   void copy_rect_(uint8_t *to, const uint8_t *from, const Rect &rect, PixelWriter *writer);
   int slot_index_(const uint8_t *buffer) const;
+  bool needs_sync_() const;
   bool settle_step_();
   void release_slot_();
 
@@ -149,7 +155,9 @@ class Receiver {
   Rect stale_[2];
   uint8_t *front_{nullptr};
   int back_{0};
-  bool is_attached_{false}, is_settling_{false}, is_slot_turn_{false};
+  bool is_attached_{false}, is_slot_turn_{false};
+  // Set by show_slot: sync without waiting until both framebuffers hold the picture.
+  bool is_sync_urgent_{false};
   size_t settle_bytes_{0};
   uint32_t settle_us_{0};
 

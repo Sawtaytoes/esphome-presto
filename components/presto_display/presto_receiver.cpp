@@ -134,7 +134,6 @@ void Receiver::attach_() {
   if (front_ == own_[1 - back_]) {
     stale_[1 - back_] = {};
   }
-  is_settling_ = slot_index_(front_) >= 0;
   is_attached_ = true;
 }
 
@@ -185,9 +184,15 @@ bool Receiver::is_live_writing_() const {
   return receiving_frame_ && is_live_started_ && !is_small_;
 }
 
-// One piece of the idle synchronization after a slot was shown.
+bool Receiver::needs_sync_() const {
+  return is_attached_ && (slot_index_(front_) >= 0 || !stale_[back_].empty());
+}
+
+// One piece of idle sync: copy part of the back buffer's stale area from the picture, or,
+// once a slot's picture is in the back buffer, move the scanout onto it. Returns true while
+// work is left.
 bool Receiver::settle_step_() {
-  if (!is_settling_) {
+  if (!needs_sync_()) {
     return false;
   }
   const uint32_t started = panel_->micros();
@@ -199,22 +204,23 @@ bool Receiver::settle_step_() {
     settle_bytes_ += piece.bytes();
     stale.y += rows;
     stale.height -= rows;
-    settle_us_ += panel_->micros() - started;
-    return true;
-  }
-  if (slot_index_(front_) >= 0) {
-    // The back buffer holds the picture: scan it out instead, which frees the slot.
+  } else {
+    // The back buffer holds the slot's picture: scan it out instead, which frees the slot.
     panel_->show(own_[back_]);
     front_ = own_[back_];
     back_ = 1 - back_;
-    settle_us_ += panel_->micros() - started;
+  }
+  settle_us_ += panel_->micros() - started;
+  if (needs_sync_()) {
     return true;
   }
-  is_settling_ = false;
+  is_sync_urgent_ = false;
   char report[64];
   snprintf(report, sizeof(report), "settled,%lu,%lu", static_cast<unsigned long>(settle_bytes_),
            static_cast<unsigned long>(settle_us_));
   panel_->publish_timing(report);
+  settle_bytes_ = 0;
+  settle_us_ = 0;
   return false;
 }
 
@@ -569,9 +575,9 @@ void Receiver::show_slot(int slot, int touch_id) {
     front_ = slots_[slot];
     // Neither own buffer is known to hold this picture.
     stale_[0] = stale_[1] = FULL_FRAME;
-    is_settling_ = true;
     settle_bytes_ = 0;
     settle_us_ = 0;
+    is_sync_urgent_ = true;
   }
   const uint32_t draw_us = panel_->micros() - started;
   presented_frame_ = int(slot_frames_[slot]);
@@ -606,7 +612,7 @@ void Receiver::blank_() {
   attach_();
   // The blank was presented with a full copy: both own buffers hold it.
   stale_[0] = stale_[1] = {};
-  is_settling_ = is_blank_pending_ = false;
+  is_blank_pending_ = is_sync_urgent_ = false;
 }
 
 bool Receiver::step() {
@@ -646,7 +652,9 @@ bool Receiver::step() {
     // A live frame is between chunks; it has the PSRAM to itself.
     return false;
   }
-  const bool has_settle = is_attached_ && is_settling_;
+  // After a slot is shown, synchronize at once; after a live frame, wait for a pause.
+  const bool has_settle = needs_sync_() && (is_sync_urgent_ || slot_index_(front_) >= 0 ||
+                                            now - last_chunk_at_ >= SYNC_DELAY_MS);
   const bool has_slot = upload_.is_active && upload_.is_decoding;
   if (!has_settle && !has_slot) {
     return false;
@@ -659,7 +667,7 @@ bool Receiver::step() {
     check_panel_();
     settle_step_();
   }
-  return report_count_ || is_settling_ || (upload_.is_active && upload_.is_decoding);
+  return report_count_ || has_settle || (upload_.is_active && upload_.is_decoding);
 }
 
 } // namespace esphome::presto_display
