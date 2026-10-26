@@ -88,7 +88,13 @@ bool Receiver::begin() {
   }
   live_decoder_ = new (std::nothrow) StreamDecoder(live_inflater_, live_dictionary_, &live_writer_);
   slot_decoder_ = new (std::nothrow) StreamDecoder(slot_inflater_, slot_dictionary_, &slot_writer_);
-  return live_decoder_ && slot_decoder_;
+  if (!live_decoder_ || !slot_decoder_) {
+    return false;
+  }
+  // JPEG is optional: without its state, codec 2 is refused and not advertised.
+  live_jpeg_.allocate();
+  live_decoder_->set_jpeg(&live_jpeg_);
+  return true;
 }
 
 void Receiver::set_slots(uint8_t *const *slots, int count) {
@@ -302,10 +308,12 @@ void Receiver::frame_chunk(int frame_id, int touch_id, int format, int offset, b
   size_t consumed = 0;
   const auto status =
       live_decoder_->feed(chunk_ + used, count - used, final_chunk, consumed, SIZE_MAX);
+  // For a JPEG the final chunk's call includes the whole decode.
   decode_us_ += panel_->micros() - started - (sync_us_ - sync_before);
   if (status == StreamDecoder::Status::FAILED ||
       (final_chunk && status != StreamDecoder::Status::COMPLETE)) {
-    error_("invalid_packet_or_base");
+    const char *reason = live_decoder_->failure();
+    error_(reason ? reason : "invalid_packet_or_base");
     return;
   }
   if (final_chunk) {
@@ -466,7 +474,9 @@ bool Receiver::slot_run_(size_t budget) {
     upload_.used += take;
     if (upload_.header_have == HEADER_BYTES) {
       PatchHeader header;
-      is_valid = parse_header(upload_.header_bytes, upload_.base_frame, header);
+      // Slots take zlib and RLE; a JPEG decodes in one piece, not in bounded idle steps.
+      is_valid = parse_header(upload_.header_bytes, upload_.base_frame, header) &&
+                 header.codec != CODEC_JPEG;
       if (is_valid) {
         slot_decoder_->begin(header, slots_[upload_.slot] + offset_of(header.rect));
       }

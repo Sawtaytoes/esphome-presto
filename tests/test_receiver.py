@@ -17,7 +17,7 @@ FRAME = PANEL * PANEL * 2
 FULL = (0, 0, PANEL, PANEL)
 SYNC_DELAY_MS = 150
 SIGNATURES = {
-    "create": ([ctypes.c_int], ctypes.c_void_p),
+    "create": ([ctypes.c_int, ctypes.c_size_t], ctypes.c_void_p),
     "destroy": ([ctypes.c_void_p], None),
     "frame_chunk": (
         [ctypes.c_void_p] + [ctypes.c_int] * 4 + [ctypes.c_bool, ctypes.c_char_p, ctypes.c_size_t],
@@ -48,6 +48,7 @@ SIGNATURES = {
     "touch_frame": ([ctypes.c_void_p], ctypes.c_int),
     "is_settling": ([ctypes.c_void_p], ctypes.c_bool),
     "is_slot_visible": ([ctypes.c_void_p], ctypes.c_bool),
+    "codecs": ([ctypes.c_void_p], ctypes.c_char_p),
     "shows": ([ctypes.c_void_p], ctypes.c_int),
     "written": ([ctypes.c_void_p], ctypes.c_size_t),
 }
@@ -99,10 +100,45 @@ def random_rect(rng):
     return x, y, rng.randint(1, PANEL - x), rng.randint(1, PANEL - y)
 
 
+JPEG_BODY_LIMIT = 128 * 1024
+# JPEGDEC on the host: no Arduino headers, and no SSE path, so it runs the same portable C as
+# the RP2350 (which has no SIMD path).
+JPEG_FLAGS = ["-D__LINUX__", "-DNO_SIMD"]
+
+
+def compile_receiver(directory):
+    """Build the harness and the shipping receiver into a library and bind its functions."""
+    tests = pathlib.Path(__file__).resolve().parent
+    root = tests.parent / "components" / "presto_display"
+    library = pathlib.Path(directory) / "receiver.so"
+    subprocess.run(
+        ["g++", "-std=c++17", "-shared", "-fPIC", "-O2", *JPEG_FLAGS, "-I", str(root)]
+        + [str(tests / "receiver_harness.cpp")]
+        + [
+            str(root / name)
+            for name in (
+                "presto_receiver.cpp",
+                "presto_stream.cpp",
+                "presto_jpeg.cpp",
+                "JPEGDEC.cpp",
+                "miniz_tinfl.c",
+            )
+        ]
+        + ["-o", str(library)],
+        check=True,
+    )
+    native = ctypes.CDLL(str(library))
+    for name, (arguments, result) in SIGNATURES.items():
+        function = getattr(native, name)
+        function.argtypes = arguments
+        function.restype = result
+    return native
+
+
 class Board:
-    def __init__(self, native, slot_count=6):
+    def __init__(self, native, slot_count=6, jpeg_capacity=JPEG_BODY_LIMIT):
         self.native = native
-        self.handle = native.create(slot_count)
+        self.handle = native.create(slot_count, jpeg_capacity)
         self.seen = self.slot_seen = 0
 
     def close(self):
@@ -159,32 +195,7 @@ class ReceiverTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.scratch = tempfile.TemporaryDirectory()
-        tests = pathlib.Path(__file__).resolve().parent
-        root = tests.parent / "components" / "presto_display"
-        library = pathlib.Path(cls.scratch.name) / "receiver.so"
-        subprocess.run(
-            [
-                "g++",
-                "-std=c++17",
-                "-shared",
-                "-fPIC",
-                "-O2",
-                "-I",
-                str(root),
-                str(tests / "receiver_harness.cpp"),
-                str(root / "presto_receiver.cpp"),
-                str(root / "presto_stream.cpp"),
-                str(root / "miniz_tinfl.c"),
-                "-o",
-                str(library),
-            ],
-            check=True,
-        )
-        cls.native = ctypes.CDLL(str(library))
-        for name, (arguments, result) in SIGNATURES.items():
-            function = getattr(cls.native, name)
-            function.argtypes = arguments
-            function.restype = result
+        cls.native = compile_receiver(cls.scratch.name)
 
     @classmethod
     def tearDownClass(cls):

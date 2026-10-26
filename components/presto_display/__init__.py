@@ -19,6 +19,9 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional("slot_events_id"): cv.use_id(text_sensor.TextSensor),
         # Optional per-frame timing report, on its own entity.
         cv.Optional("timing_id"): cv.use_id(text_sensor.TextSensor),
+        # The live codecs the firmware decodes, `zlib,rle,jpeg`. CastKit sends JPEG only when
+        # this entity lists it.
+        cv.Optional("codecs_id"): cv.use_id(text_sensor.TextSensor),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -33,3 +36,5 @@ async def to_code(config):
         cg.add(var.set_slot_events(await cg.get_variable(config["slot_events_id"])))
     if "timing_id" in config:
         cg.add(var.set_timing(await cg.get_variable(config["timing_id"])))
+    if "codecs_id" in config:
+        cg.add(var.set_codecs(await cg.get_variable(config["codecs_id"])))

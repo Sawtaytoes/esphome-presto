@@ -87,6 +87,7 @@ struct Bench {
   HostPanel panel;
   Receiver receiver{&panel};
   std::vector<std::vector<uint8_t>> slots;
+  std::vector<uint8_t> jpeg;
 };
 Bench &begin(void *bench) {
   auto *b = static_cast<Bench *>(bench);
@@ -101,11 +102,16 @@ bool inside(const Rect &rect, int x, int y) {
 } // namespace
 
 extern "C" {
-void *create(int slot_count) {
+// `jpeg_capacity` 0 is a board without the JPEG buffer.
+void *create(int slot_count, size_t jpeg_capacity) {
   auto *bench = new Bench;
   if (!bench->receiver.begin()) {
     delete bench;
     return nullptr;
+  }
+  if (jpeg_capacity) {
+    bench->jpeg.assign(jpeg_capacity, uint8_t(0xa5));
+    bench->receiver.set_jpeg_buffer(bench->jpeg.data(), jpeg_capacity);
   }
   std::vector<uint8_t *> pointers;
   for (int i = 0; i < slot_count; ++i) {
@@ -213,6 +219,9 @@ bool is_settling(void *bench) {
 }
 bool is_slot_visible(void *bench) {
   return static_cast<Bench *>(bench)->receiver.is_slot_visible();
+}
+const char *codecs(void *bench) {
+  return static_cast<Bench *>(bench)->receiver.codecs();
 }
 int shows(void *bench) {
   return static_cast<Bench *>(bench)->panel.shows;

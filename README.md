@@ -15,7 +15,8 @@ during scanout also passed. Encrypted frame transfer and wireless OTA are verifi
 Gesture latency is still being tuned in CastKit's browser worker; this is not a
 claim that every application or workload has been validated. The streaming
 receiver and frame slots compile for RP2350 with ESPHome 2026.10.0 and pass the
-host tests, but have not yet been measured on a panel.
+host tests, but have not yet been measured on a panel. The same is true of JPEG patches
+(codec 2), which compile with ESPHome 2026.9.1 and pass the host tests.
 
 ## Try the hardware
 
@@ -87,6 +88,56 @@ for it; the marker appears only if that frame fails. A live frame that receives 
 chunk for three seconds is abandoned, so a sender that stops part way never holds
 back the offline marker or the idle work below.
 
+**Wire format.** A packet is a big-endian `>IHHHHB` header (base frame id, x, y,
+width, height, codec) and a body, base64-encoded and sent in chunks of at most 4,000
+characters. The codec is `0` for zlib or `1` for CastKit RLE of big-endian RGB565 rows,
+or `2` for a baseline JPEG. A base of `0` needs the full 480×480 rectangle; any other base
+must be the frame on screen.
+
+### JPEG patches (codec 2)
+
+A camera picture compresses about five times smaller as a JPEG than as zlib, so a
+codec 2 patch is the one to use for camera frames. It travels through `frame_chunk`
+exactly like codecs 0 and 1, with the same base and rectangle checks and the same
+acknowledgement, and its pixels replace exactly the header's rectangle in the back
+buffer. The rules:
+
+- One baseline scan of 8-bit YCbCr, with chroma 4:4:4, 4:2:2, or 4:2:0. Restart markers,
+  application segments, and comments are accepted. Progressive, arithmetic, lossless,
+  grayscale, and multi-scan files are not.
+- The JPEG's width and height must equal the rectangle's.
+- The compressed body is at most 131,072 bytes (128 KiB). A q75 480×360 camera frame is
+  about 30 KB.
+- Live frames only. A `slot_chunk` with codec 2 reports status `3`.
+
+The body is collected in a 128 KiB PSRAM buffer allocated once at boot, through the same
+paced writer as every other PSRAM write, and read back behind the prefetch gate. On the
+final chunk the receiver checks it marker by marker, then decodes it with JPEGDEC
+(about 18 KB of SRAM state, allocated once), which hands back blocks of big-endian RGB565
+that are clipped to the rectangle and written row by row through the paced writer. The
+decode runs in one piece inside the final chunk's action; touch polling continues during its
+paced writes. The `<decode µs>` of the acknowledgement includes it. JPEGDEC repeats each
+subsampled chroma sample over its block instead of interpolating, so a 4:2:0 color edge is
+slightly blockier than in a desktop decoder; luma is unaffected.
+
+A rejected JPEG answers one of these, and the picture does not change:
+
+| Event | Cause |
+| --- | --- |
+| `error,jpeg_too_large` | The body passed 131,072 bytes. Sent as soon as it does, before the final chunk. |
+| `error,jpeg_size_mismatch` | The image is not exactly the rectangle's width and height. |
+| `error,jpeg_unsupported` | Progressive, arithmetic, lossless, 12-bit, grayscale, multi-scan, or another chroma layout. |
+| `error,jpeg_invalid` | Malformed or truncated, no end-of-image marker at the end, bytes after it, missing tables, or a decoder failure. |
+| `error,jpeg_unavailable` | The board could not allocate the JPEG memory at boot. |
+
+As with every failed frame, later chunks of the same frame then answer
+`error,chunk_order_or_size`.
+
+The optional `codecs_id` text sensor ("Display Codecs" in the example) holds the live
+codecs this firmware decodes: `zlib,rle,jpeg`, or `zlib,rle` when the JPEG memory could
+not be allocated. CastKit sends JPEG only when that entity exists and lists `jpeg`, so a
+board with older firmware keeps getting zlib.
+
 After a swap, the new back framebuffer differs from the picture only where the
 last frame drew. Idle time copies that area from the visible framebuffer in small
 paced steps, starting 150 ms after the last live chunk, so a continuous stream is
@@ -133,6 +184,7 @@ no single action or loop step publishes two states on one entity:
 | Display Events | `events_id` (required) | `frame,…` and `error,…` acknowledgements, `touch,…`, `wake,…`, `wake_controls,…`, `controls,…` |
 | Display Slot Events | `slot_events_id` | `slot,<slot>,<frame_id>,<status>`, at most one per loop step |
 | Display Timing | `timing_id` | `timing,…`, `slot_timing,…`, `settled,…` |
+| Display Codecs | `codecs_id` | `zlib,rle,jpeg`, published once at boot |
 
 Without `slot_events_id`, slot uploads still work but report nothing, and CastKit
 needs those reports to use slots. Touch reads continue during long PSRAM copies
@@ -140,7 +192,7 @@ inside an action, so a `touch,…` can still share a call with that action's
 acknowledgement on Display Events; the acknowledgement is published last.
 
 The slots take 2,764,800 bytes of the 8 MiB PSRAM, beside the two framebuffers
-(921,600 bytes). CastKit detects slot support by the presence of the `show_slot`
+(921,600 bytes) and the JPEG buffer (131,072 bytes). CastKit detects slot support by the presence of the `show_slot`
 action, so an older CastKit keeps working with this firmware.
 
 The optional `timing_id` text sensor ("Display Timing" in the example) reports
@@ -150,9 +202,10 @@ frame, `slot_timing,<slot>,<frame>,<rect bytes>,<decode µs>,<PSRAM write µs>,<
 chunk to decoded ms>,<free PSRAM bytes>` for each upload, and `settled,<bytes>,<µs>`
 when the framebuffers match the picture again after a slot was shown.
 
-The receiver's frame logic (`presto_receiver.cpp`, `presto_stream.cpp`) has no
-ESPHome or Pico types; `tests/test_receiver.py` and `tests/test_pixels.py`
-compile and drive that exact code on the host.
+The receiver's frame logic (`presto_receiver.cpp`, `presto_stream.cpp`,
+`presto_jpeg.cpp`) has no ESPHome or Pico types; `tests/test_receiver.py`,
+`tests/test_jpeg.py`, and `tests/test_pixels.py` compile and drive that exact code, with the
+vendored miniz and JPEGDEC, on the host.
 
 At zero backlight brightness the panel is dark but still listens for a press.
 The first press lights it at the wake level CastKit sends through
@@ -173,8 +226,9 @@ esphome compile examples/hardware-test.yaml
 esphome compile examples/castkit.yaml
 ```
 
-The receiver and decoder tests compile and execute the actual C++/miniz code on
-the host; they require `g++`. CI compiles all three firmware examples and checks the
+The receiver and decoder tests compile and execute the actual C++, miniz, and JPEGDEC
+code on the host; they require `g++`, and the JPEG tests require Pillow
+(`pip install pillow`) to encode their synthetic images. CI compiles all three firmware examples and checks the
 project's Python and C++ formatting. Vendored code retains upstream formatting.
 See [UPSTREAM.md](UPSTREAM.md) for licenses, pinned sources and adaptations.
 

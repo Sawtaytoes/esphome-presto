@@ -2,15 +2,27 @@
 // Streaming patch decoder. Pure C++ with no ESPHome or Pico types, so the host tests
 // compile and drive the exact code that ships.
 //
-// Wire format: `>IHHHHB` (base frame, x, y, width, height, codec) + body, where codec
-// 0 = zlib and 1 = CastKit RLE. Each base64-decoded chunk (at most 3,000 B, in SRAM) is
-// fed to the decoder as it arrives, and the output rows are written straight to their
-// destination: the back framebuffer, or a frame slot. There is no PSRAM staging buffer.
+// Wire format: `>IHHHHB` (base frame, x, y, width, height, codec) + body. The codec is
+// 0 = zlib or 1 = CastKit RLE, both of big-endian RGB565 rows, or 2 = a baseline JPEG whose
+// width and height equal the rectangle's. Each base64-decoded chunk (at most 3,000 B, in
+// SRAM) is fed to the decoder as it arrives. Codecs 0 and 1 write their output rows straight
+// to the destination: the back framebuffer, or a frame slot. Codec 2 collects the compressed
+// body (at most JPEG_BODY_LIMIT bytes, PSRAM on the board) and decodes it on the final chunk
+// (presto_jpeg.h); it is accepted only by a decoder given a JpegDecoder, so live frames take
+// JPEG and frame slots do not.
 #include <cstddef>
 #include <cstdint>
 #include "miniz_tinfl.h"
 
 namespace esphome::presto_display {
+
+class JpegDecoder;
+
+enum Codec : uint8_t {
+  CODEC_ZLIB = 0,
+  CODEC_RLE = 1,
+  CODEC_JPEG = 2,
+};
 
 constexpr int PANEL = 480;
 constexpr size_t FRAME_BYTES = size_t(PANEL) * PANEL * 2;
@@ -37,7 +49,8 @@ struct PatchHeader {
 };
 
 // Parse the 13-byte header and check it against the frame its destination holds now: a
-// full 480x480 frame with base 0, or any rectangle with base == `current_frame`.
+// full 480x480 frame with base 0, or any rectangle with base == `current_frame`. Any of the
+// three codecs passes; a destination that cannot take one rejects it after parsing.
 bool parse_header(const uint8_t *bytes, uint32_t current_frame, PatchHeader &header);
 
 // Stores decoded bytes. On the board `write` is a paced SRAM -> PSRAM copy.
@@ -59,6 +72,9 @@ class StreamDecoder {
   };
   StreamDecoder(tinfl_decompressor *inflater, uint8_t *dictionary, PixelWriter *writer)
       : inflater_(inflater), dictionary_(dictionary), writer_(writer) {}
+  // Accept codec 2 through `jpeg`. Without one, a JPEG body fails with `jpeg_unavailable`.
+  void set_jpeg(JpegDecoder *jpeg) { jpeg_ = jpeg; }
+  bool has_jpeg() const;
   // Start a patch. `target` is where the rectangle's top-left pixel goes and `stride` is
   // the target's row length in pixels: PANEL for a framebuffer or a slot, or the width for
   // a compact buffer.
@@ -71,6 +87,9 @@ class StreamDecoder {
   Status feed(const uint8_t *data, size_t size, bool is_last, size_t &consumed, size_t budget);
   size_t produced() const { return produced_; }
   const PatchHeader &header() const { return header_; }
+  // Why the last FAILED happened, for `error,<reason>`: a `jpeg_...` reason for a JPEG body,
+  // otherwise nullptr.
+  const char *failure() const { return failure_; }
 
  protected:
   void emit_(const uint8_t *data, size_t size);
@@ -79,9 +98,12 @@ class StreamDecoder {
                     size_t &budget);
   Status feed_rle_(const uint8_t *data, size_t size, bool is_last, size_t &consumed,
                    size_t &budget);
+  Status feed_jpeg_(const uint8_t *data, size_t size, bool is_last, size_t &consumed);
   tinfl_decompressor *inflater_;
   uint8_t *dictionary_;
   PixelWriter *writer_;
+  JpegDecoder *jpeg_{nullptr};
+  const char *failure_{nullptr};
   uint8_t *target_{nullptr};
   int stride_{PANEL};
   PatchHeader header_;
