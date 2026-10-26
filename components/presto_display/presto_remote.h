@@ -20,6 +20,9 @@ class PrestoRemote : public Component, public Panel {
   void loop() override;
   void set_display(PrestoDisplay *display) { display_ = display; }
   void set_events(text_sensor::TextSensor *events) { events_ = events; }
+  // `slot,...` reports. Without it slots still work but report nothing, and CastKit needs
+  // the reports to use slots.
+  void set_slot_events(text_sensor::TextSensor *slot_events) { slot_events_ = slot_events; }
   // Optional diagnostic sensor. A separate entity, so a timing report can never replace a
   // queued acknowledgement in ESPHome's one-state-per-entity send buffer.
   void set_timing(text_sensor::TextSensor *timing) { timing_ = timing; }
@@ -46,6 +49,7 @@ class PrestoRemote : public Component, public Panel {
   void show(uint8_t *buffer) override;
   void blank() override;
   void publish(const char *event) override;
+  void publish_slot(const char *event) override;
   void publish_timing(const char *report) override;
   uint32_t micros() override;
   uint32_t millis() override;
@@ -56,7 +60,7 @@ class PrestoRemote : public Component, public Panel {
   bool is_ready_();
   void apply_brightness_();
   PrestoDisplay *display_{nullptr};
-  text_sensor::TextSensor *events_{nullptr}, *timing_{nullptr};
+  text_sensor::TextSensor *events_{nullptr}, *slot_events_{nullptr}, *timing_{nullptr};
   Receiver receiver_;
   HighFrequencyLoopRequester high_frequency_;
   uint32_t last_touch_poll_{0};
