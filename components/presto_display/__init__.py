@@ -14,6 +14,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.GenerateID(): cv.declare_id(PrestoRemote),
         cv.Required(CONF_DISPLAY_ID): cv.use_id(PrestoDisplay),
         cv.Required("events_id"): cv.use_id(text_sensor.TextSensor),
+        # Optional per-frame timing report, on its own entity.
+        cv.Optional("timing_id"): cv.use_id(text_sensor.TextSensor),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -24,3 +26,5 @@ async def to_code(config):
     await cg.register_component(var, config)
     cg.add(var.set_display(await cg.get_variable(config[CONF_DISPLAY_ID])))
     cg.add(var.set_events(await cg.get_variable(config["events_id"])))
+    if "timing_id" in config:
+        cg.add(var.set_timing(await cg.get_variable(config["timing_id"])))
