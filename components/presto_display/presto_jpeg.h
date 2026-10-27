@@ -47,7 +47,8 @@ struct JpegInfo {
 class JpegDecoder {
  public:
   explicit JpegDecoder(PixelReader *reader) : reader_(reader) {}
-  // Allocates JPEGDEC's state (about 18 KB, SRAM). False if that failed.
+  // Allocates JPEGDEC's state (about 18 KB, SRAM) and a 15 KB SRAM band for its output.
+  // False if JPEGDEC's state failed; without the band, strips are written as they arrive.
   bool allocate();
   // Where the compressed body is collected: PSRAM on the board.
   void set_buffer(uint8_t *buffer, size_t capacity) {
@@ -72,6 +73,7 @@ class JpegDecoder {
 
  protected:
   bool read_(size_t at, uint8_t *to, size_t length);
+  void flush_band_();
 
   PixelReader *reader_;
   JPEGDEC *codec_{nullptr};
@@ -84,6 +86,13 @@ class JpegDecoder {
   PixelWriter *writer_{nullptr};
   size_t drawn_{0};
   bool is_outside_{false};
+  // JPEGDEC hands over 2048 pixels at a time: a 4:2:0 MCU row comes as 128-pixel strips, and
+  // every PSRAM write pays the scanout gate and the pacing pause however short it is. One MCU
+  // row of the rectangle is gathered here, so PSRAM sees whole rows (a camera patch: one
+  // contiguous run per band), about a quarter of the write calls.
+  static constexpr int BAND_ROWS = 16;
+  uint16_t *band_{nullptr};
+  int band_y_{0}, band_height_{0}, band_width_{0};
 };
 
 } // namespace esphome::presto_display

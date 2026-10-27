@@ -51,6 +51,7 @@ SIGNATURES = {
     "codecs": ([ctypes.c_void_p], ctypes.c_char_p),
     "shows": ([ctypes.c_void_p], ctypes.c_int),
     "written": ([ctypes.c_void_p], ctypes.c_size_t),
+    "write_calls": ([ctypes.c_void_p], ctypes.c_size_t),
 }
 
 

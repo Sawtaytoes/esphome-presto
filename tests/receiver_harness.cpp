@@ -20,6 +20,7 @@ class HostPanel : public Panel {
     }
     memcpy(to, from, size);
     written += size;
+    ++write_calls;
   }
   void read(uint8_t *to, const uint8_t *from, size_t size) override { memcpy(to, from, size); }
   uint8_t *framebuffer(int index) override { return own_[index & 1].data(); }
@@ -69,6 +70,7 @@ class HostPanel : public Panel {
   int double_publishes{0}, visible_writes{0};
   uint32_t now_ms{1000};
   size_t written{0};
+  size_t write_calls{0};
   int shows{0};
 
  private:
@@ -228,5 +230,8 @@ int shows(void *bench) {
 }
 size_t written(void *bench) {
   return static_cast<Bench *>(bench)->panel.written;
+}
+size_t write_calls(void *bench) {
+  return static_cast<Bench *>(bench)->panel.write_calls;
 }
 }

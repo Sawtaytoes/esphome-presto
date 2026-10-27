@@ -1,5 +1,6 @@
 #include "presto_jpeg.h"
 #include <algorithm>
+#include <cstring>
 #include <new>
 #include "JPEGDEC.h"
 
@@ -40,6 +41,9 @@ static int draw_callback(JPEGDRAW *draw) {
 bool JpegDecoder::allocate() {
   if (!codec_) {
     codec_ = new (std::nothrow) JPEGDEC;
+  }
+  if (!band_) {
+    band_ = new (std::nothrow) uint16_t[size_t(PANEL) * BAND_ROWS];
   }
   return codec_ != nullptr;
 }
@@ -218,6 +222,7 @@ JpegResult JpegDecoder::decode(const Rect &rect, uint8_t *target, int stride, Pi
   writer_ = writer;
   drawn_ = 0;
   is_outside_ = false;
+  band_width_ = 0;
   if (!codec_->open(this, int(size_), nullptr, read_callback, seek_callback, draw_callback)) {
     return JpegResult::INVALID;
   }
@@ -227,6 +232,7 @@ JpegResult JpegDecoder::decode(const Rect &rect, uint8_t *target, int stride, Pi
                codec_->getJPEGType() == JPEG_MODE_BASELINE;
   is_ok = is_ok && codec_->decode(0, 0, 0);
   codec_->close();
+  flush_band_();
   // Every pixel of the rectangle exactly once, and nothing outside it.
   is_ok = is_ok && !is_outside_ && drawn_ == size_t(rect.width) * size_t(rect.height);
   return is_ok ? JpegResult::OK : JpegResult::INVALID;
@@ -239,13 +245,50 @@ bool JpegDecoder::draw_(int x, int y, int pitch, int width, int height, const ui
     is_outside_ = true;
     return false;
   }
+  drawn_ += size_t(width) * size_t(height);
+  // Strips arrive left to right along one MCU row. Anything else is written as it comes.
+  if (band_width_ && (y != band_y_ || height != band_height_ || x != band_width_)) {
+    flush_band_();
+  }
+  if (band_ && height <= BAND_ROWS && x == band_width_) {
+    if (!band_width_) {
+      band_y_ = y;
+      band_height_ = height;
+    }
+    for (int row = 0; row < height; ++row) {
+      memcpy(band_ + size_t(row) * size_t(rect_.width) + size_t(x), pixels + size_t(row) * pitch,
+             size_t(width) * 2);
+    }
+    band_width_ = x + width;
+    if (band_width_ == rect_.width) {
+      flush_band_();
+    }
+    return true;
+  }
   const size_t bytes = size_t(width) * 2;
   for (int row = 0; row < height; ++row) {
     uint8_t *to = target_ + (size_t(y + row) * size_t(stride_) + size_t(x)) * 2;
     writer_->write(to, reinterpret_cast<const uint8_t *>(pixels + size_t(row) * pitch), bytes);
   }
-  drawn_ += size_t(width) * size_t(height);
   return true;
+}
+
+void JpegDecoder::flush_band_() {
+  if (!band_width_) {
+    return;
+  }
+  const uint8_t *from = reinterpret_cast<const uint8_t *>(band_);
+  uint8_t *to = target_ + (size_t(band_y_) * size_t(stride_)) * 2;
+  if (band_width_ == rect_.width && rect_.width == stride_) {
+    // Full-width rows are one contiguous run in the framebuffer.
+    writer_->write(to, from, size_t(rect_.width) * size_t(band_height_) * 2);
+  } else {
+    for (int row = 0; row < band_height_; ++row) {
+      writer_->write(to + size_t(row) * size_t(stride_) * 2,
+                     from + size_t(row) * size_t(rect_.width) * 2, size_t(band_width_) * 2);
+    }
+  }
+  band_width_ = 0;
 }
 
 } // namespace esphome::presto_display
