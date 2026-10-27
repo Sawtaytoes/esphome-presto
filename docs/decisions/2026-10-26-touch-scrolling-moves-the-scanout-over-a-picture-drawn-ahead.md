@@ -32,8 +32,9 @@ and costs no PSRAM writes.
    vertically than sideways, the board takes it over: it reports that move as a release with
    flag `1` (CastKit cancels the contact), reports nothing more of it, and moves the window
    with the finger from the press, clamped to the picture. A quick release glides on with
-   exponential friction (time constant 325 ms); a press during a glide stops it and is never
-   a tap. At rest the board reports `scroll_at,<frame_id>,<scroll_y>` so CastKit can scroll
+   exponential friction (time constant 325 ms); a press on the window during a glide stops
+   it and is never a tap, and a press outside the window ends the glide and is CastKit's as
+   usual. At rest the board reports `scroll_at,<frame_id>,<scroll_y>` so CastKit can scroll
    its page to match. Every forwarded touch also carries flag `2` and the window's offset in
    its last field, so CastKit can match the page before it hit-tests a press.
 5. **PSRAM budget.** The picture is allocated once at boot after the six slots: as many rows
@@ -72,7 +73,10 @@ only where everything else on those rows is the same in every row of a column.
 
 Known limits: rows of a scroll container that are not on the 8-row grid keep the live
 picture (CastKit snaps the window inward); the picture is not decoded from JPEG; the drag
-and glide have not been measured on a panel yet.
+and glide have not been measured on a panel yet. Before an upload writes into the picture,
+the board waits for two window latches, but at most 100 ms (six frames at 60 Hz), because a
+scanout paused for OTA latches nothing. If the scanout ever ran below 20 fps, the upload's
+first rows could reach the glass for one frame: a torn picture, never a write outside it.
 
 ## Evidence
 

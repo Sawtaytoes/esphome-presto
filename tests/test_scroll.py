@@ -482,6 +482,28 @@ class ScrollTests(unittest.TestCase):
         self.board.idle()
         self.assertEqual(self.board.new_slot_events(), [f"scroll_at,50,{stopped}"])
 
+    def test_a_press_outside_the_window_during_a_glide_is_castkits(self):
+        self.shown_picture(height=ROWS)
+        self.fling()
+        for _ in range(3):
+            self.board.advance(16)
+            self.board.step()
+        stopped = self.offset()
+        # A tap on the header above the window: forwarded, and the glide rests where it is.
+        press = self.board.contact(PRESS, 200, 30)
+        self.assertTrue(press["is_forwarded"])
+        self.assertEqual((press["phase"], press["flags"]), (PRESS, TOUCH_WINDOW))
+        self.assertEqual(press["offset"], stopped)
+        # A vertical move from there never scrolls the list.
+        self.assertTrue(self.board.contact(MOVE, 200, 80)["is_forwarded"])
+        for _ in range(5):
+            self.board.advance(16)
+            self.board.step()
+        self.assertEqual(self.offset(), stopped)
+        self.assertTrue(self.board.contact(RELEASE, 0, 0)["is_forwarded"])
+        self.board.idle()
+        self.assertEqual(self.board.new_slot_events(), [f"scroll_at,50,{stopped}"])
+
     def test_a_glide_stops_at_the_end(self):
         self.shown_picture(height=500, offset=0)
         self.fling()

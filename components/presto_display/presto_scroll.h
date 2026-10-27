@@ -75,7 +75,11 @@ class WindowLatch {
  public:
   // Core 0.
   void request(uint32_t word) { requested_.store(word, std::memory_order_release); }
-  uint32_t requested() const { return requested_.load(std::memory_order_acquire); }
+  // `requested()` and `active()` also run inside the display core's line-transfer interrupt
+  // (through `plan_batch`), so they are forced inline like it: no call into flash there.
+  PRESTO_SCROLL_INLINE uint32_t requested() const {
+    return requested_.load(std::memory_order_acquire);
+  }
   // Counts latches. Two latches after a request, nothing reads the window it replaced.
   uint32_t latches() const { return latches_.load(std::memory_order_acquire); }
 
@@ -90,7 +94,7 @@ class WindowLatch {
     active_ = word;
     latches_.fetch_add(1, std::memory_order_acq_rel);
   }
-  uint32_t active() const { return active_; }
+  PRESTO_SCROLL_INLINE uint32_t active() const { return active_; }
 
  protected:
   std::atomic<uint32_t> requested_{0}, latches_{0};
@@ -140,15 +144,20 @@ class ScrollDrag {
       last_y_ = y;
       last_at_ = now;
       speed_ = 0;
-      if (is_gliding_ && window.is_shown) {
-        // A press during a glide only stops it, as on a phone; it is never a tap.
+      const bool is_inside = window.is_shown && y >= window.top && y < window.bottom;
+      if (is_gliding_ && is_inside) {
+        // A press on the list during a glide only stops it, as on a phone; it is never a tap.
         is_gliding_ = false;
         start_offset_ = window.offset;
         state_ = State::OWNED;
         return Verdict::OWN;
       }
-      is_gliding_ = false;
-      const bool is_inside = window.is_shown && y >= window.top && y < window.bottom;
+      if (is_gliding_) {
+        // A press elsewhere (a header, a button) is CastKit's as usual. The glide ends where it
+        // is and that rest is reported; the press itself carries the offset as well.
+        is_gliding_ = false;
+        is_settled_ = window.is_shown;
+      }
       state_ = is_inside ? State::PENDING : State::FORWARDED;
       start_offset_ = window.offset;
       return Verdict::FORWARD;

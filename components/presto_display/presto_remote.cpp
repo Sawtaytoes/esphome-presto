@@ -298,7 +298,10 @@ void PrestoRemote::set_window(const Window &window) {
 
 // The scanout latches a window once per frame, at the first row batch of the next frame. One
 // latch may have read the request before it changed, so the second one is the first that is
-// certain to have seen it. A scanout paused for OTA latches nothing; give up after 100 ms.
+// certain to have seen it. A scanout paused for OTA latches nothing, so the wait cannot be
+// unbounded; it gives up after 100 ms, six frames at the panel's 60 Hz. Giving up early can
+// only cost looks, never memory: the picture is always allocated, so the upload's first rows
+// may be scanned out for one frame (a torn picture), and only if the scanout ran below 20 fps.
 void PrestoRemote::release_window() {
   const uint32_t start = display_->get_scroll_window_latches();
   const uint32_t began = esphome::millis();

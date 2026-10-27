@@ -212,8 +212,8 @@ still reaches the page. When it has moved 12 rows vertically, and more verticall
 sideways, the board takes it over: that report goes out as a release with flag `1`, which
 CastKit treats as a cancel, and nothing more of the contact is reported. The window then
 follows the finger from the press, clamped to the picture. A sideways drag stays CastKit's.
-A quick release glides on and slows with friction; a press during the glide stops it and is
-never a tap. When the picture comes to rest the board reports `scroll_at,<frame_id>,<scroll_y>`
+A quick release glides on and slows with friction; a press on the window during the glide
+stops it and is never a tap, and a press outside the window ends the glide and goes to CastKit. When the picture comes to rest the board reports `scroll_at,<frame_id>,<scroll_y>`
 on Display Slot Events, and CastKit scrolls its page to match.
 
 A touch report is `touch,<sequence>,<phase>,<x>,<y>,<flags>,<frame>,<offset>`. Flag `1` is a
