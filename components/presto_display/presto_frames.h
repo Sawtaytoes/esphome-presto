@@ -28,7 +28,7 @@ struct FrameReport {
   uint32_t window_overruns{0}; // prefetch overruns during the report window
   uint32_t gate_us{0}, copy_us{0}, pace_us{0}; // all paced writes, including stale sync
   uint32_t max_gate_us{0};
-  uint32_t max_interval_us{0}; // all presentation intervals, including idle gaps
+  uint32_t max_interval_us{0}; // intervals between eligible frames, including idle gaps
 };
 
 // The display for LVGL's partial renderer (`partial_frames: true`). LVGL draws each strip
@@ -82,6 +82,7 @@ class PrestoFrameDisplay : public PrestoDisplay {
   bool is_frame_started_{false};
   uint32_t frame_write_us_{0}, frame_vsync_us_{0}, frame_pixels_{0};
   uint32_t frame_gate_us_{0}, frame_copy_us_{0}, frame_pace_us_{0};
+  uint32_t frame_max_gate_us_{0};
   uint32_t max_gate_us_{0}, max_interval_us_{0};
   uint64_t gate_sum_us_{0}, copy_sum_us_{0}, pace_sum_us_{0};
   // The report window.

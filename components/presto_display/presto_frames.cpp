@@ -72,7 +72,7 @@ void PrestoFrameDisplay::paced_write_(uint8_t *to, const uint8_t *from, size_t s
     const uint32_t copy_start = time_us_32();
     const uint32_t gate_us = copy_start - gate_start;
     frame_gate_us_ += gate_us;
-    max_gate_us_ = std::max(max_gate_us_, gate_us);
+    frame_max_gate_us_ = std::max(frame_max_gate_us_, gate_us);
     memcpy(to, from, count);
     frame_copy_us_ += time_us_32() - copy_start;
     to += count;
@@ -187,6 +187,7 @@ void PrestoFrameDisplay::present_frame() {
     gate_sum_us_ += frame_gate_us_;
     copy_sum_us_ += frame_copy_us_;
     pace_sum_us_ += frame_pace_us_;
+    max_gate_us_ = std::max(max_gate_us_, frame_max_gate_us_);
     if (has_last_present_) {
       max_interval_us_ = std::max(max_interval_us_, now - last_present_us_);
     }
@@ -200,6 +201,7 @@ void PrestoFrameDisplay::present_frame() {
   is_frame_started_ = false;
   frame_write_us_ = frame_vsync_us_ = frame_pixels_ = 0;
   frame_gate_us_ = frame_copy_us_ = frame_pace_us_ = 0;
+  frame_max_gate_us_ = 0;
 }
 
 bool PrestoFrameDisplay::take_report(FrameReport &report) {
@@ -246,7 +248,8 @@ void PrestoFrameDisplay::format_report(const FrameReport &report, char *detail, 
            ms(report.write_us), ms(report.vsync_us), ms(report.sync_us), ms(report.present_us),
            unsigned(report.pixels), unsigned(report.frames), unsigned(report.small_frames),
            unsigned(report.overruns), unsigned(report.window_overruns), ms(report.gate_us),
-           ms(report.copy_us), ms(report.pace_us), ms(report.max_gate_us), ms(report.max_interval_us));
+           ms(report.copy_us), ms(report.pace_us), ms(report.max_gate_us),
+           ms(report.max_interval_us));
   if (report.fps > 0) {
     snprintf(summary, summary_size, "%.1f fps  %u ms  ovr %u", report.fps,
              unsigned((report.frame_us + 500) / 1000), unsigned(report.overruns));
