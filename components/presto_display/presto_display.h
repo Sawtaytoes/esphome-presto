@@ -51,3 +51,6 @@ class PrestoDisplay : public display::DisplayBuffer {
 #ifdef USE_PRESTO_TOUCH
 #include "presto_touch.h"
 #endif
+#ifdef USE_PRESTO_PARTIAL_FRAMES
+#include "presto_frames.h"
+#endif
