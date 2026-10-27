@@ -17,7 +17,7 @@ FRAME = PANEL * PANEL * 2
 FULL = (0, 0, PANEL, PANEL)
 SYNC_DELAY_MS = 150
 SIGNATURES = {
-    "create": ([ctypes.c_int, ctypes.c_size_t], ctypes.c_void_p),
+    "create": ([ctypes.c_int, ctypes.c_size_t, ctypes.c_int], ctypes.c_void_p),
     "destroy": ([ctypes.c_void_p], None),
     "frame_chunk": (
         [ctypes.c_void_p] + [ctypes.c_int] * 4 + [ctypes.c_bool, ctypes.c_char_p, ctypes.c_size_t],
@@ -52,6 +52,31 @@ SIGNATURES = {
     "shows": ([ctypes.c_void_p], ctypes.c_int),
     "written": ([ctypes.c_void_p], ctypes.c_size_t),
     "write_calls": ([ctypes.c_void_p], ctypes.c_size_t),
+    "scroll_chunk": (
+        [ctypes.c_void_p] + [ctypes.c_int] * 3 + [ctypes.c_bool, ctypes.c_char_p, ctypes.c_size_t],
+        None,
+    ),
+    "scroll_show": ([ctypes.c_void_p] + [ctypes.c_int] * 4, None),
+    "scroll_hide": ([ctypes.c_void_p], None),
+    "touch": ([ctypes.c_void_p] + [ctypes.c_int] * 3 + [ctypes.POINTER(ctypes.c_int)], None),
+    "frame_start": ([ctypes.c_void_p], None),
+    "composite": ([ctypes.c_void_p], ctypes.c_void_p),
+    "latched_window": ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)], None),
+    "scroll_memory": ([ctypes.c_void_p], ctypes.c_void_p),
+    "scroll_frame": ([ctypes.c_void_p], ctypes.c_uint),
+    "scroll_height": ([ctypes.c_void_p], ctypes.c_int),
+    "releases": ([ctypes.c_void_p], ctypes.c_int),
+    "window_requests": ([ctypes.c_void_p], ctypes.c_int),
+    "latch_create": ([], ctypes.c_void_p),
+    "latch_destroy": ([ctypes.c_void_p], None),
+    "latch_request": ([ctypes.c_void_p, ctypes.c_bool] + [ctypes.c_int] * 3, None),
+    "latch_publish_requested": ([ctypes.c_void_p], None),
+    "latch_count": ([ctypes.c_void_p], ctypes.c_uint),
+    "plan_row": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_bool], ctypes.c_int),
+    "round_trip_window": (
+        [ctypes.c_bool] + [ctypes.c_int] * 3 + [ctypes.POINTER(ctypes.c_int)],
+        None,
+    ),
 }
 
 
@@ -137,9 +162,9 @@ def compile_receiver(directory):
 
 
 class Board:
-    def __init__(self, native, slot_count=6, jpeg_capacity=JPEG_BODY_LIMIT):
+    def __init__(self, native, slot_count=6, jpeg_capacity=JPEG_BODY_LIMIT, scroll_rows=0):
         self.native = native
-        self.handle = native.create(slot_count, jpeg_capacity)
+        self.handle = native.create(slot_count, jpeg_capacity, scroll_rows)
         self.seen = self.slot_seen = 0
 
     def close(self):

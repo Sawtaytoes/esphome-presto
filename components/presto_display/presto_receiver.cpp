@@ -10,6 +10,27 @@ static size_t offset_of(const Rect &rect) {
   return (size_t(rect.y) * PANEL + rect.x) * 2;
 }
 
+static int read16(const uint8_t *p) {
+  return int(p[0]) << 8 | p[1];
+}
+
+// The scroll picture's packet: base 0 with the whole picture (x 0, y 0, PANEL wide, 1 to
+// `rows` high), or base == `current_frame` with a rectangle inside its `current_height`.
+static bool parse_scroll_header(const uint8_t *p, uint32_t current_frame, int current_height,
+                                int rows, PatchHeader &header) {
+  header.base = uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+  header.rect = {read16(p + 4), read16(p + 6), read16(p + 8), read16(p + 10)};
+  header.codec = p[12];
+  const Rect &r = header.rect;
+  if (!r.width || !r.height || r.x + r.width > PANEL || header.codec > CODEC_RLE) {
+    return false;
+  }
+  if (!header.base) {
+    return !r.x && !r.y && r.width == PANEL && r.height <= rows;
+  }
+  return header.base == current_frame && r.y + r.height <= current_height;
+}
+
 static int base64_value(char c) {
   if (c >= 'A' && c <= 'Z') {
     return c - 'A';
@@ -105,6 +126,22 @@ void Receiver::set_slots(uint8_t *const *slots, int count) {
   }
 }
 
+void Receiver::set_scroll_picture(uint8_t *picture, int rows) {
+  scroll_picture_ = rows > 0 ? picture : nullptr;
+  scroll_rows_ = scroll_picture_ ? rows : 0;
+  scroll_frame_ = 0;
+  scroll_height_ = 0;
+}
+
+const char *Receiver::codecs() const {
+  snprintf(codecs_, sizeof(codecs_), "%s", has_jpeg() ? "zlib,rle,jpeg" : "zlib,rle");
+  if (scroll_rows_) {
+    const size_t used = strlen(codecs_);
+    snprintf(codecs_ + used, sizeof(codecs_) - used, ",scroll=%d", scroll_rows_);
+  }
+  return codecs_;
+}
+
 uint32_t Receiver::slot_frame(int slot) const {
   return slot >= 0 && slot < slot_count_ ? slot_frames_[slot] : 0;
 }
@@ -176,7 +213,7 @@ size_t Receiver::prepare_back_(const Rect &next) {
 
 // The back buffer, which differs from the visible picture only inside `drawn`, is shown.
 void Receiver::present_back_(const Rect &drawn) {
-  panel_->show(own_[back_]);
+  show_(own_[back_]);
   const int other = 1 - back_;
   // The other own buffer was the picture (or a stale copy of a slot); either way it now
   // differs from the new picture by at most its old staleness plus `drawn`.
@@ -212,7 +249,7 @@ bool Receiver::settle_step_() {
     stale.height -= rows;
   } else {
     // The back buffer holds the slot's picture: scan it out instead, which frees the slot.
-    panel_->show(own_[back_]);
+    show_(own_[back_]);
     front_ = own_[back_];
     back_ = 1 - back_;
   }
@@ -243,10 +280,125 @@ void Receiver::release_slot_() {
     settle_bytes_ += stale_[target].bytes();
     stale_[target] = {};
   }
-  panel_->show(own_[target]);
+  show_(own_[target]);
   front_ = own_[target];
   back_ = 1 - target;
   settle_us_ += panel_->micros() - started;
+}
+
+// Every swap: it takes effect with the window requested before it, so once a hidden window
+// is swapped past, nothing reads the scroll picture.
+void Receiver::show_(uint8_t *buffer) {
+  panel_->show(buffer);
+  if (!window_.is_shown) {
+    is_window_latched_ = false;
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// Scroll window: `scroll_show`, `scroll_hide`, and the board's own drag
+
+int Receiver::max_offset_() const {
+  return window_.is_shown ? std::max(0, scroll_height_ - window_.height()) : 0;
+}
+
+void Receiver::queue_window_report_(int frame_id, int status) {
+  SlotReport &report = queue_report_();
+  if (status != SLOT_OK) {
+    snprintf(report.event, sizeof(report.event), "scroll_window,%d,%d,0,0,0", frame_id, status);
+  } else if (!window_.is_shown) {
+    snprintf(report.event, sizeof(report.event), "scroll_window,0,0,0,0,0");
+  } else {
+    snprintf(report.event, sizeof(report.event), "scroll_window,%d,0,%d,%d,%d", frame_id,
+             window_.top, window_.bottom, window_.offset);
+  }
+}
+
+// Hide the window from the next frame. Before writing into the picture (`is_writing`), wait
+// until the scanout has stopped reading it.
+void Receiver::hide_window_(bool is_writing) {
+  if (window_.is_shown) {
+    window_ = Window{};
+    drag_.reset();
+    panel_->set_window(window_);
+    queue_window_report_(0, SLOT_OK);
+  }
+  if (is_writing && is_window_latched_) {
+    panel_->release_window();
+    is_window_latched_ = false;
+  }
+}
+
+void Receiver::scroll_show(int frame_id, int top, int bottom, int scroll_y) {
+  if (upload_.is_active && upload_.slot == SCROLL_TARGET && upload_.is_final) {
+    // Its final chunk has arrived; finish decoding it now.
+    slot_run_(SIZE_MAX);
+  }
+  int status = SLOT_OK;
+  if (!scroll_picture_ || frame_id <= 0 || uint32_t(frame_id) != scroll_frame_) {
+    status = SLOT_UNAVAILABLE;
+  } else if (top < 0 || bottom > PANEL || top >= bottom || top % WINDOW_ALIGN ||
+             bottom % WINDOW_ALIGN || bottom - top > scroll_height_) {
+    status = SLOT_INVALID_PACKET;
+  }
+  if (status != SLOT_OK) {
+    queue_window_report_(frame_id, status);
+    return;
+  }
+  // A contact begun on the window as it was belongs to that window.
+  drag_.reset();
+  window_.is_shown = true;
+  window_.top = top;
+  window_.bottom = bottom;
+  window_.offset = std::clamp(scroll_y, 0, max_offset_());
+  panel_->set_window(window_);
+  is_window_latched_ = true;
+  queue_window_report_(frame_id, SLOT_OK);
+}
+
+void Receiver::scroll_hide() {
+  const bool was_shown = window_.is_shown;
+  hide_window_(false);
+  if (!was_shown) {
+    // Answer every hide, so CastKit always hears the window's state.
+    queue_window_report_(0, SLOT_OK);
+  }
+}
+
+Receiver::TouchReport Receiver::touch(int phase, int x, int y) {
+  bool is_moved = false;
+  const auto verdict = drag_.touch(phase, x, y, panel_->millis(), window_, max_offset_(), is_moved);
+  if (is_moved) {
+    panel_->set_window(window_);
+  }
+  TouchReport report;
+  report.is_forwarded = verdict != ScrollDrag::Verdict::OWN;
+  report.phase = phase;
+  if (window_.is_shown) {
+    report.flags = TOUCH_WINDOW;
+    report.offset = window_.offset;
+  }
+  if (verdict == ScrollDrag::Verdict::TAKE) {
+    report.phase = 2;
+    report.flags |= TOUCH_TAKEN;
+  }
+  return report;
+}
+
+// The glide after a fling, and the `scroll_at` report once a local scroll rests. True while
+// the glide continues.
+bool Receiver::glide_(uint32_t now) {
+  bool is_moved = false;
+  const bool is_gliding = drag_.glide(now, window_, max_offset_(), is_moved);
+  if (is_moved) {
+    panel_->set_window(window_);
+  }
+  if (drag_.take_settled() && window_.is_shown) {
+    SlotReport &report = queue_report_();
+    snprintf(report.event, sizeof(report.event), "scroll_at,%lu,%d",
+             static_cast<unsigned long>(scroll_frame_), window_.offset);
+  }
+  return is_gliding;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -371,6 +523,10 @@ void Receiver::finish_live_(int frame_id, int touch_id) {
   uint32_t present_us = 0;
   if (is_changed) {
     const uint32_t present_started = panel_->micros();
+    if (!header_.base) {
+      // A full frame is a fresh start: the window goes with the swap.
+      hide_window_(false);
+    }
     present_back_(rect);
     present_us = panel_->micros() - present_started;
   }
@@ -399,7 +555,7 @@ void Receiver::finish_live_(int frame_id, int touch_id) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Slots: `slot_chunk`, `show_slot`, `drop_slots`
+// Slots and the scroll picture: `slot_chunk`, `scroll_chunk`, `show_slot`, `drop_slots`
 
 void Receiver::slot_end_() {
   upload_.is_active = upload_.is_decoding = false;
@@ -409,6 +565,26 @@ void Receiver::slot_end_() {
 void Receiver::slot_finish_() {
   const int slot = upload_.slot;
   const bool is_ok = upload_.status == SLOT_OK;
+  if (slot == SCROLL_TARGET) {
+    scroll_frame_ = is_ok ? uint32_t(upload_.frame_id) : 0;
+    if (is_ok) {
+      scroll_height_ = upload_.height;
+    }
+    SlotReport &report = queue_report_();
+    snprintf(report.event, sizeof(report.event), "scroll,%d,%d", upload_.frame_id, upload_.status);
+    if (is_ok) {
+      // scroll_timing,<frame>,<rect bytes>,<decode us>,<PSRAM write us>,
+      //               <first chunk to decoded ms>,<free PSRAM bytes>
+      snprintf(report.timing, sizeof(report.timing), "scroll_timing,%d,%lu,%lu,%lu,%lu,%lu",
+               upload_.frame_id, static_cast<unsigned long>(slot_decoder_->header().rect.bytes()),
+               static_cast<unsigned long>(upload_.decode_us),
+               static_cast<unsigned long>(slot_writer_.us),
+               static_cast<unsigned long>(panel_->millis() - upload_.first_chunk_at),
+               static_cast<unsigned long>(panel_->free_psram()));
+    }
+    slot_end_();
+    return;
+  }
   slot_frames_[slot] = is_ok ? uint32_t(upload_.frame_id) : 0;
   SlotReport &report = queue_slot_report_(slot, upload_.frame_id, upload_.status);
   if (is_ok) {
@@ -424,17 +600,24 @@ void Receiver::slot_finish_() {
   slot_end_();
 }
 
-// Slot outcomes wait here and leave one per `step()`. ESPHome keeps only the newest state of
-// an entity that has not been sent yet, so two reports in one call could lose one.
-Receiver::SlotReport &Receiver::queue_slot_report_(int slot, int frame_id, int status) {
+// Reports for Display Slot Events wait here and leave one per `step()`. ESPHome keeps only the
+// newest state of an entity that has not been sent yet, so two reports in one call could lose
+// one.
+Receiver::SlotReport &Receiver::queue_report_() {
   if (report_count_ == REPORT_CAPACITY) {
-    // Never expected (one report per final chunk); keep the newest.
+    // Never expected (a few reports per action); keep the newest.
     report_first_ = (report_first_ + 1) % REPORT_CAPACITY;
     --report_count_;
   }
   SlotReport &report = reports_[(report_first_ + report_count_++) % REPORT_CAPACITY];
-  snprintf(report.event, sizeof(report.event), "slot,%d,%d,%d", slot, frame_id, status);
+  report.event[0] = '\0';
   report.timing[0] = '\0';
+  return report;
+}
+
+Receiver::SlotReport &Receiver::queue_slot_report_(int slot, int frame_id, int status) {
+  SlotReport &report = queue_report_();
+  snprintf(report.event, sizeof(report.event), "slot,%d,%d,%d", slot, frame_id, status);
   return report;
 }
 
@@ -451,6 +634,16 @@ void Receiver::slot_error_(int slot, int frame_id, int status, bool final_chunk)
     }
     return;
   }
+  if (slot == SCROLL_TARGET) {
+    // Any failure leaves the picture empty, so it is no longer shown either.
+    hide_window_(false);
+    scroll_frame_ = 0;
+    if (final_chunk) {
+      SlotReport &report = queue_report_();
+      snprintf(report.event, sizeof(report.event), "scroll,%d,%d", frame_id, status);
+    }
+    return;
+  }
   if (slot >= 0 && slot < slot_count_) {
     slot_frames_[slot] = 0;
   }
@@ -459,8 +652,8 @@ void Receiver::slot_error_(int slot, int frame_id, int status, bool final_chunk)
   }
 }
 
-// Decode the buffered chunk into the slot, stopping after about `budget` bytes. True while
-// some of it is left.
+// Decode the buffered chunk into the slot or picture, stopping after about `budget` bytes.
+// True while some of it is left.
 bool Receiver::slot_run_(size_t budget) {
   if (!upload_.is_active || !upload_.is_decoding) {
     return false;
@@ -474,11 +667,21 @@ bool Receiver::slot_run_(size_t budget) {
     upload_.used += take;
     if (upload_.header_have == HEADER_BYTES) {
       PatchHeader header;
-      // Slots take zlib and RLE; a JPEG decodes in one piece, not in bounded idle steps.
-      is_valid = parse_header(upload_.header_bytes, upload_.base_frame, header) &&
-                 header.codec != CODEC_JPEG;
-      if (is_valid) {
-        slot_decoder_->begin(header, slots_[upload_.slot] + offset_of(header.rect));
+      if (upload_.slot == SCROLL_TARGET) {
+        // zlib and RLE only: a JPEG decodes in one piece, not in bounded idle steps.
+        is_valid = parse_scroll_header(upload_.header_bytes, upload_.base_frame, scroll_height_,
+                                       scroll_rows_, header);
+        if (is_valid) {
+          upload_.height = header.base ? scroll_height_ : header.rect.height;
+          slot_decoder_->begin(header, scroll_picture_ + offset_of(header.rect));
+        }
+      } else {
+        // Slots take zlib and RLE; a JPEG decodes in one piece, not in bounded idle steps.
+        is_valid = parse_header(upload_.header_bytes, upload_.base_frame, header) &&
+                   header.codec != CODEC_JPEG;
+        if (is_valid) {
+          slot_decoder_->begin(header, slots_[upload_.slot] + offset_of(header.rect));
+        }
       }
     } else {
       is_valid = !upload_.is_final;
@@ -511,37 +714,68 @@ void Receiver::slot_chunk(int slot, int frame_id, int format, int offset, bool f
                           const char *encoded, size_t size) {
   // The previous chunk's bytes share the one upload buffer: finish them first.
   slot_run_(SIZE_MAX);
-  if (slot < 0 || slot >= slot_count_ || !slot_decoder_) {
+  if (slot < 0 || slot >= slot_count_) {
+    // No such slot (and never the scroll picture's target).
+    if (final_chunk) {
+      queue_slot_report_(slot, frame_id, SLOT_UNAVAILABLE);
+    }
+    return;
+  }
+  if (!slot_decoder_) {
     slot_error_(slot, frame_id, SLOT_UNAVAILABLE, final_chunk);
     return;
   }
+  upload_chunk_(slot, frame_id, format, offset, final_chunk, encoded, size);
+}
+
+void Receiver::scroll_chunk(int frame_id, int format, int offset, bool final_chunk,
+                            const char *encoded, size_t size) {
+  slot_run_(SIZE_MAX);
+  if (!scroll_picture_ || !slot_decoder_) {
+    slot_error_(SCROLL_TARGET, frame_id, SLOT_UNAVAILABLE, final_chunk);
+    return;
+  }
+  upload_chunk_(SCROLL_TARGET, frame_id, format, offset, final_chunk, encoded, size);
+}
+
+// One chunk of an upload into a slot or (`target` SCROLL_TARGET) the scroll picture.
+void Receiver::upload_chunk_(int target, int frame_id, int format, int offset, bool final_chunk,
+                             const char *encoded, size_t size) {
   if (frame_id <= 0 || format != 4 || offset < 0 || size == 0 || size > 4000 || size % 4) {
-    slot_error_(slot, frame_id, SLOT_INVALID_CHUNK, final_chunk);
+    slot_error_(target, frame_id, SLOT_INVALID_CHUNK, final_chunk);
     return;
   }
   if (!offset) {
-    // One upload at a time: a new one abandons an unfinished one, whose slot stays empty.
+    // One upload at a time: a new one abandons an unfinished one, whose target stays empty.
     slot_end_();
-    check_panel_();
-    if (front_ == slots_[slot]) {
-      release_slot_();
+    if (target == SCROLL_TARGET) {
+      // The picture is rewritten in place: nothing may scan it out meanwhile.
+      hide_window_(true);
+      upload_.base_frame = scroll_frame_;
+      upload_.height = scroll_height_;
+      scroll_frame_ = 0;
+    } else {
+      check_panel_();
+      if (front_ == slots_[target]) {
+        release_slot_();
+      }
+      upload_.base_frame = slot_frames_[target];
+      // The slot is rewritten in place, so it is empty until the upload completes.
+      slot_frames_[target] = 0;
     }
     upload_.is_active = true;
     upload_.is_final = false;
-    upload_.slot = slot;
+    upload_.slot = target;
     upload_.frame_id = frame_id;
     upload_.status = SLOT_OK;
-    upload_.base_frame = slot_frames_[slot];
     upload_.encoded_offset = upload_.header_have = 0;
     upload_.decode_us = 0;
     upload_.first_chunk_at = panel_->millis();
     slot_writer_.us = 0;
-    // The slot is rewritten in place, so it is empty until the upload completes.
-    slot_frames_[slot] = 0;
   }
-  if (!upload_.is_active || upload_.slot != slot || upload_.frame_id != frame_id ||
+  if (!upload_.is_active || upload_.slot != target || upload_.frame_id != frame_id ||
       size_t(offset) != upload_.encoded_offset) {
-    slot_error_(slot, frame_id, SLOT_CHUNK_ORDER, final_chunk);
+    slot_error_(target, frame_id, SLOT_CHUNK_ORDER, final_chunk);
     return;
   }
   upload_.encoded_offset += size;
@@ -556,7 +790,7 @@ void Receiver::slot_chunk(int slot, int frame_id, int format, int offset, bool f
   const size_t count =
       decode_base64_chunk(encoded, size, final_chunk, upload_.data, sizeof(upload_.data));
   if (!count) {
-    slot_error_(slot, frame_id, SLOT_INVALID_CHUNK, final_chunk);
+    slot_error_(target, frame_id, SLOT_INVALID_CHUNK, final_chunk);
     return;
   }
   upload_.size = count;
@@ -579,9 +813,11 @@ void Receiver::show_slot(int slot, int touch_id) {
   // A live patch in flight was made against the picture this replaces.
   abandon_live_();
   check_panel_();
+  // A slot is a whole other view: the window goes with the swap.
+  hide_window_(false);
   const uint32_t started = panel_->micros();
   if (front_ != slots_[slot]) {
-    panel_->show(slots_[slot]);
+    show_(slots_[slot]);
     front_ = slots_[slot];
     // Neither own buffer is known to hold this picture.
     stale_[0] = stale_[1] = FULL_FRAME;
@@ -611,6 +847,8 @@ void Receiver::drop_slots() {
   for (int i = 0; i < SLOT_COUNT; ++i) {
     slot_frames_[i] = 0;
   }
+  hide_window_(false);
+  scroll_frame_ = 0;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -618,7 +856,10 @@ void Receiver::drop_slots() {
 
 void Receiver::blank_() {
   abandon_live_();
+  // The offline marker replaces the whole picture, window included.
+  hide_window_(false);
   panel_->blank();
+  is_window_latched_ = false;
   attach_();
   // The blank was presented with a full copy: both own buffers hold it.
   stale_[0] = stale_[1] = {};
@@ -638,6 +879,8 @@ bool Receiver::step() {
     return true;
   }
   const uint32_t now = panel_->millis();
+  // A glide only moves the scanout's source; it costs no PSRAM time and runs every step.
+  const bool is_gliding = glide_(now);
   if (receiving_frame_ && now - last_chunk_at_ > STALL_MS) {
     // A sender that stopped mid-frame must not hold back idle work or the offline blank.
     abandon_live_();
@@ -660,14 +903,14 @@ bool Receiver::step() {
   }
   if (receiving_frame_) {
     // A live frame is between chunks; it has the PSRAM to itself.
-    return false;
+    return is_gliding || report_count_;
   }
   // After a slot is shown, synchronize at once; after a live frame, wait for a pause.
   const bool has_settle = needs_sync_() && (is_sync_urgent_ || slot_index_(front_) >= 0 ||
                                             now - last_chunk_at_ >= SYNC_DELAY_MS);
   const bool has_slot = upload_.is_active && upload_.is_decoding;
   if (!has_settle && !has_slot) {
-    return false;
+    return is_gliding || report_count_;
   }
   // Alternate when both are waiting, so neither starves the other.
   is_slot_turn_ = has_slot && (!has_settle || !is_slot_turn_);
@@ -677,7 +920,7 @@ bool Receiver::step() {
     check_panel_();
     settle_step_();
   }
-  return report_count_ || has_settle || (upload_.is_active && upload_.is_decoding);
+  return is_gliding || report_count_ || has_settle || (upload_.is_active && upload_.is_decoding);
 }
 
 } // namespace esphome::presto_display

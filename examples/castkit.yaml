@@ -60,6 +60,26 @@ api:
     - action: drop_slots
       then:
         - lambda: id(presto_remote).drop_slots();
+    - action: scroll_chunk
+      variables:
+        frame_id: int
+        format: int
+        offset: int
+        final_chunk: bool
+        image_data: string
+      then:
+        - lambda: id(presto_remote).scroll_chunk(frame_id, format, offset, final_chunk, image_data);
+    - action: scroll_show
+      variables:
+        frame_id: int
+        top: int
+        bottom: int
+        scroll_y: int
+      then:
+        - lambda: id(presto_remote).scroll_show(frame_id, top, bottom, scroll_y);
+    - action: scroll_hide
+      then:
+        - lambda: id(presto_remote).scroll_hide();
     - action: set_display_controls
       variables:
         revision: int

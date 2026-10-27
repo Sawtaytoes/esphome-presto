@@ -211,11 +211,15 @@ void __not_in_flash_func(ST7701::start_line_xfer)()
             (!busy && display_row >= prefetch_row)) ++prefetch_overruns;
         if (!busy && display_row >= prefetch_row - int(SCANLINE_COUNT / 2)) {
             const int row = prefetch_row % DISPLAY_HEIGHT;
+            // A frame's first batch latches the scroll window; inside it, rows come from
+            // the scroll picture. Window edges are 8-row aligned, like the batches.
+            const uint16_t *source = esphome::presto_display::plan_batch(
+                window_latch, framebuffer, window_picture, width, row);
             // The paced XIP streaming FIFO avoids direct PSRAM DMA stalls.
             dma_channel_set_write_addr(prefetch_dma,
                 scanlines[bank][row & (SCANLINE_COUNT - 1)], false);
             dma_channel_set_trans_count(prefetch_dma, width * PREFETCH_ROWS / 2, true);
-            xip_ctrl_hw->stream_addr = uintptr_t(framebuffer + width * row);
+            xip_ctrl_hw->stream_addr = uintptr_t(source);
             xip_ctrl_hw->stream_ctr = width * PREFETCH_ROWS / 2;
             prefetch_row += PREFETCH_ROWS;
         }
@@ -233,6 +237,8 @@ void __not_in_flash_func(ST7701::start_frame_xfer)()
             while (!(xip_ctrl_hw->stat & XIP_STAT_FIFO_EMPTY)) (void)xip_ctrl_hw->stream_fifo;
             scanline_bank.fetch_xor(1, std::memory_order_release);
             prefetch_row = SCANLINE_COUNT;
+            // Its first rows were copied with this window; the rest are fetched with it.
+            window_latch.publish(next_window);
         }
         framebuffer = next;
     }
@@ -286,8 +292,12 @@ void __not_in_flash_func(ST7701::start_frame_xfer)()
   void ST7701::resume_scanout() {
       if (!palette) {
           const uint8_t bank = scanline_bank.load(std::memory_order_relaxed);
+          const uint32_t window = window_latch.requested();
           for (uint row = 0; row < SCANLINE_COUNT; ++row)
-              memcpy(scanlines[bank][row], framebuffer + width * row, width * sizeof(uint16_t));
+              memcpy(scanlines[bank][row],
+                     esphome::presto_display::window_row(framebuffer, window_picture, width, row, window),
+                     width * sizeof(uint16_t));
+          window_latch.publish(window);
           prefetch_row = SCANLINE_COUNT;
       }
       pio_sm_clear_fifos(st_pio, timing_sm);
@@ -311,11 +321,16 @@ void __not_in_flash_func(ST7701::start_frame_xfer)()
       // swap. Vertical blank then performs no PSRAM copy or decode work.
       if (!palette) {
           const uint8_t bank = scanline_bank.load(std::memory_order_acquire) ^ 1;
+          // The scroll window requested now goes with the swap.
+          const uint32_t window = window_latch.requested();
           for (uint row = 0; row < SCANLINE_COUNT; ++row) {
               wait_for_prefetch();
-              memcpy(scanlines[bank][row], next_fb + width * row, width * sizeof(uint16_t));
+              memcpy(scanlines[bank][row],
+                     esphome::presto_display::window_row(next_fb, window_picture, width, row, window),
+                     width * sizeof(uint16_t));
               sleep_us(50);
           }
+          next_window = window;
       }
       requested_framebuffer = next_fb;
       next_framebuffer.store(next_fb, std::memory_order_release);

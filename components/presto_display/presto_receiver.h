@@ -13,10 +13,16 @@
 // buffers are then stale everywhere, and idle time copies the slot into them at once, swaps
 // the panel back onto an own buffer with the same picture (so the slot is free to be
 // rewritten), and stops once both own buffers match the picture again.
+//
+// Scroll window (presto_scroll.h). A tall picture in PSRAM, uploaded like a slot, can be
+// scanned out over panel rows [top, bottom) at any of its rows; a vertical drag that starts
+// in the window moves it on the board alone. Nothing is ever written into the picture while
+// the scanout may read it: an upload first hides the window and waits two frames.
 #include <cstddef>
 #include <cstdint>
 #include "miniz_tinfl.h"
 #include "presto_jpeg.h"
+#include "presto_scroll.h"
 #include "presto_stream.h"
 
 namespace esphome::presto_display {
@@ -32,6 +38,15 @@ enum SlotStatus : int {
   SLOT_INVALID_PACKET = 3, // bad header, wrong base frame, or a malformed body
   SLOT_UNAVAILABLE = 4, // slot number out of range, or no PSRAM for slots
   SLOT_DROPPED = 5, // drop_slots arrived while the final chunk was still decoding
+};
+
+// Bits of the sixth field of `touch,<sequence>,<phase>,<x>,<y>,<flags>,<frame>,<offset>`.
+enum TouchFlags : int {
+  // The board took this contact over for a scroll: the report is a release (phase 2) that
+  // CastKit must treat as a cancel, and the contact's later reports are not sent.
+  TOUCH_TAKEN = 1,
+  // A scroll window is shown, and the last field is its offset.
+  TOUCH_WINDOW = 2,
 };
 
 class Panel : public PixelWriter, public PixelReader {
@@ -52,6 +67,13 @@ class Panel : public PixelWriter, public PixelReader {
   virtual void publish_slot(const char *event) = 0;
   // Display Timing (optional diagnostics).
   virtual void publish_timing(const char *report) = 0;
+  // Scan the window's rows out of the scroll picture from the next frame start, or every row
+  // from the framebuffer again when it is hidden. A `show` returns with the window requested
+  // before it in effect.
+  virtual void set_window(const Window &window) = 0;
+  // Returns once the scanout reads nothing from the scroll picture (two frames after it was
+  // hidden).
+  virtual void release_window() = 0;
   virtual uint32_t micros() = 0;
   virtual uint32_t millis() = 0;
   virtual uint32_t overruns() = 0;
@@ -76,8 +98,12 @@ class Receiver {
     live_jpeg_.set_buffer(buffer, capacity);
   }
   bool has_jpeg() const { return live_jpeg_.is_ready(); }
-  // The Display Codecs state: the live codecs this receiver decodes.
-  const char *codecs() const { return has_jpeg() ? "zlib,rle,jpeg" : "zlib,rle"; }
+  // The scroll picture: `rows` rows of PANEL pixels (PSRAM on the board). `rows` 0 is none.
+  void set_scroll_picture(uint8_t *picture, int rows);
+  int scroll_rows() const { return scroll_rows_; }
+  // The Display Codecs state: the live codecs this receiver decodes, then `scroll=<rows>`
+  // when it holds a scroll picture.
+  const char *codecs() const;
 
   // API actions. `encoded` is base64, at most 4,000 characters per chunk.
   void frame_chunk(int frame_id, int touch_id, int format, int offset, bool final_chunk,
@@ -85,7 +111,25 @@ class Receiver {
   void slot_chunk(int slot, int frame_id, int format, int offset, bool final_chunk,
                   const char *encoded, size_t size);
   void show_slot(int slot, int touch_id);
+  // Empties every slot and the scroll picture, and hides the window.
   void drop_slots();
+  // The scroll picture: `scroll_chunk` uploads it like a slot (`scroll,<frame>,<status>` on
+  // Display Slot Events); `scroll_show` scans it out over rows [top, bottom) from its row
+  // `scroll_y` and `scroll_hide` stops that, each reported as
+  // `scroll_window,<frame>,<status>,<top>,<bottom>,<offset>` (frame 0 is hidden).
+  void scroll_chunk(int frame_id, int format, int offset, bool final_chunk, const char *encoded,
+                    size_t size);
+  void scroll_show(int frame_id, int top, int bottom, int scroll_y);
+  void scroll_hide();
+
+  // What to report for one contact report: `touch,<seq>,<phase>,<x>,<y>,<flags>,<frame>,<offset>`
+  // when `is_forwarded`. A contact the board scrolls with is not reported; when it comes to
+  // rest the board reports `scroll_at,<frame>,<offset>` on Display Slot Events.
+  struct TouchReport {
+    bool is_forwarded{true};
+    int phase{0}, flags{0}, offset{0};
+  };
+  TouchReport touch(int phase, int x, int y);
 
   // One bounded piece of idle work (offline blank, slot decode, framebuffer sync). Returns
   // true while more is queued, so the caller can keep the loop running fast.
@@ -96,6 +140,9 @@ class Receiver {
   int presented_frame() const { return presented_frame_; }
   // Test and diagnostic views.
   uint32_t slot_frame(int slot) const;
+  uint32_t scroll_frame() const { return scroll_frame_; }
+  int scroll_height() const { return scroll_height_; }
+  const Window &window() const { return window_; }
   // True while idle sync has work left: a stale back buffer, or a slot on screen.
   bool is_settling() const { return needs_sync_(); }
   bool is_slot_visible() const { return slot_index_(front_) >= 0; }
@@ -114,6 +161,8 @@ class Receiver {
   // Idle work per `step()`: framebuffer rows synchronized, or slot bytes decoded.
   static constexpr int SETTLE_ROWS = 16;
   static constexpr size_t SLOT_BUDGET = 16384;
+  // The upload target that is the scroll picture rather than a slot.
+  static constexpr int SCROLL_TARGET = -1;
 
  protected:
   class TimedWriter : public PixelWriter {
@@ -143,14 +192,24 @@ class Receiver {
   bool needs_sync_() const;
   bool settle_step_();
   void release_slot_();
+  void show_(uint8_t *buffer);
+
+  // Scroll window.
+  void hide_window_(bool is_writing);
+  void queue_window_report_(int frame_id, int status);
+  bool glide_(uint32_t now);
+  int max_offset_() const;
 
   // Slots.
   struct SlotReport {
-    char event[40];
+    char event[64];
     char timing[112];
   };
+  SlotReport &queue_report_();
   SlotReport &queue_slot_report_(int slot, int frame_id, int status);
   void blank_();
+  void upload_chunk_(int target, int frame_id, int format, int offset, bool final_chunk,
+                     const char *encoded, size_t size);
   void slot_error_(int slot, int frame_id, int status, bool final_chunk);
   void slot_finish_();
   bool slot_run_(size_t budget);
@@ -198,7 +257,8 @@ class Receiver {
   int slot_count_{0};
   struct SlotUpload {
     bool is_active{false}, is_final{false}, is_decoding{false};
-    int slot{0}, frame_id{0}, status{SLOT_OK};
+    // `slot` is SCROLL_TARGET for the scroll picture; `height` is the picture's height after it.
+    int slot{0}, frame_id{0}, status{SLOT_OK}, height{0};
     uint32_t base_frame{0};
     size_t encoded_offset{0}, header_have{0};
     uint8_t header_bytes[HEADER_BYTES];
@@ -207,9 +267,20 @@ class Receiver {
     size_t size{0}, used{0};
     uint32_t decode_us{0}, first_chunk_at{0};
   } upload_;
-  static constexpr int REPORT_CAPACITY = 2 * SLOT_COUNT;
+  static constexpr int REPORT_CAPACITY = 2 * SLOT_COUNT + 4;
   SlotReport reports_[REPORT_CAPACITY];
   int report_first_{0}, report_count_{0};
+
+  // Scroll window.
+  uint8_t *scroll_picture_{nullptr};
+  int scroll_rows_{0}, scroll_height_{0};
+  uint32_t scroll_frame_{0};
+  Window window_;
+  // True while the scanout may still read the picture: from a show until a swap or a release
+  // after the window was hidden.
+  bool is_window_latched_{false};
+  ScrollDrag drag_;
+  mutable char codecs_[48]{};
 };
 
 // Strict base64 for one chunk: groups of four, '=' padding only at the end of the final

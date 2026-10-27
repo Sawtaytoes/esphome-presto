@@ -13,6 +13,8 @@
 #include <atomic>
 #include <cstring>
 
+#include "presto_scroll.h"
+
 namespace pimoroni {
   constexpr uint PIN_UNUSED = 255;
   enum Rotation { ROTATE_0, ROTATE_90, ROTATE_180, ROTATE_270 };
@@ -97,6 +99,13 @@ namespace pimoroni {
     void set_framebuffer(uint16_t* next_fb);
     uint32_t get_prefetch_overruns() const { return prefetch_overruns.load(std::memory_order_relaxed); }
 
+    // Scroll window (presto_scroll.h): rows of a tall picture scanned out in place of
+    // framebuffer rows. The picture is set once, before any window is requested; a
+    // requested window is latched by the first row batch of the next frame.
+    void set_window_picture(uint16_t* picture) { window_picture = picture; }
+    void request_window(uint32_t word) { window_latch.request(word); }
+    uint32_t get_window_latches() const { return window_latch.latches(); }
+
     void wait_for_vsync();
 
     // Only to be called by ISR
@@ -124,6 +133,11 @@ namespace pimoroni {
 
     uint16_t* framebuffer;
     std::atomic<uint16_t *> next_framebuffer{nullptr};
+
+    esphome::presto_display::WindowLatch window_latch;
+    const uint16_t* window_picture = nullptr;
+    // The window the next framebuffer's first rows were copied with.
+    uint32_t next_window = 0;
 
     uint32_t* palette = nullptr;
 

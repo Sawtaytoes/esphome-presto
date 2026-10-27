@@ -37,9 +37,6 @@ void PrestoRemote::setup() {
   if (!receiver_.has_jpeg()) {
     ESP_LOGW(TAG, "No memory for JPEG patches; live frames use zlib and RLE only");
   }
-  if (codecs_) {
-    codecs_->publish_state(receiver_.codecs());
-  }
   // Frame slots live in PSRAM for the life of the firmware; drop_slots only empties them.
   // A slot that could not be allocated answers every upload with SLOT_UNAVAILABLE.
   uint8_t *slots[SLOT_COUNT];
@@ -51,7 +48,25 @@ void PrestoRemote::setup() {
     ESP_LOGW(TAG, "PSRAM for %d of %d frame slots", count, SLOT_COUNT);
   }
   receiver_.set_slots(slots, count);
-  ESP_LOGI(TAG, "%d frame slots, %u bytes of PSRAM free", count,
+  // The scroll picture takes what the slots left, less a reserve, so it can never starve
+  // them. It is allocated once and only ever emptied.
+  const size_t free = rp2040.getFreePSRAMHeap();
+  const size_t row_bytes = size_t(PANEL) * 2;
+  int rows = free > SCROLL_PSRAM_RESERVE
+                 ? int(std::min(size_t(SCROLL_MAX_ROWS), (free - SCROLL_PSRAM_RESERVE) / row_bytes))
+                 : 0;
+  uint8_t *picture =
+      rows >= SCROLL_MIN_ROWS ? static_cast<uint8_t *>(pmalloc(size_t(rows) * row_bytes)) : nullptr;
+  if (!picture) {
+    rows = 0;
+    ESP_LOGW(TAG, "No PSRAM for the scroll picture; drags go to CastKit");
+  }
+  display_->set_scroll_picture(reinterpret_cast<uint16_t *>(picture));
+  receiver_.set_scroll_picture(picture, rows);
+  if (codecs_) {
+    codecs_->publish_state(receiver_.codecs());
+  }
+  ESP_LOGI(TAG, "%d frame slots, %d scroll rows, %u bytes of PSRAM free", count, rows,
            unsigned(rp2040.getFreePSRAMHeap()));
 }
 
@@ -97,6 +112,35 @@ void PrestoRemote::drop_slots() {
   }
 }
 
+void PrestoRemote::scroll_chunk(int frame_id, int format, int offset, bool final_chunk,
+                                const StringRef &encoded) {
+  if (!is_ready_()) {
+    if (final_chunk) {
+      char event[64];
+      snprintf(event, sizeof(event), "scroll,%d,%d", frame_id, int(SLOT_UNAVAILABLE));
+      publish_slot(event);
+    }
+    return;
+  }
+  receiver_.scroll_chunk(frame_id, format, offset, final_chunk, encoded.c_str(), encoded.size());
+}
+
+void PrestoRemote::scroll_show(int frame_id, int top, int bottom, int scroll_y) {
+  if (!is_ready_()) {
+    char event[64];
+    snprintf(event, sizeof(event), "scroll_window,%d,%d,0,0,0", frame_id, int(SLOT_UNAVAILABLE));
+    publish_slot(event);
+    return;
+  }
+  receiver_.scroll_show(frame_id, top, bottom, scroll_y);
+}
+
+void PrestoRemote::scroll_hide() {
+  if (is_ready_()) {
+    receiver_.scroll_hide();
+  }
+}
+
 void PrestoRemote::touch(int phase, int x, int y) {
   if (phase < 0 || phase > 2 || x < 0 || x >= 480 || y < 0 || y >= 480) {
     return;
@@ -120,8 +164,14 @@ void PrestoRemote::touch(int phase, int x, int y) {
     last_x_ = x;
     last_y_ = y;
   }
+  // A vertical drag on the scroll window is the board's own; everything else goes on.
+  const Receiver::TouchReport report = receiver_.touch(phase, x, y);
+  if (!report.is_forwarded) {
+    return;
+  }
   char event[100];
-  snprintf(event, sizeof(event), "touch,%d,%d,%d,%d,0,%d,0", ++sequence_, phase, x, y, shown);
+  snprintf(event, sizeof(event), "touch,%d,%d,%d,%d,%d,%d,%d", ++sequence_, report.phase, x, y,
+           report.flags, shown, report.offset);
   publish(event);
 }
 
@@ -239,6 +289,22 @@ void PrestoRemote::publish_slot(const char *event) {
 void PrestoRemote::publish_timing(const char *report) {
   if (timing_) {
     timing_->publish_state(report);
+  }
+}
+
+void PrestoRemote::set_window(const Window &window) {
+  display_->set_scroll_window(pack_window(window));
+}
+
+// The scanout latches a window once per frame, at the first row batch of the next frame. One
+// latch may have read the request before it changed, so the second one is the first that is
+// certain to have seen it. A scanout paused for OTA latches nothing; give up after 100 ms.
+void PrestoRemote::release_window() {
+  const uint32_t start = display_->get_scroll_window_latches();
+  const uint32_t began = esphome::millis();
+  while (display_->get_scroll_window_latches() - start < 2 && esphome::millis() - began < 100) {
+    poll_touch();
+    sleep_us(250);
   }
 }
 

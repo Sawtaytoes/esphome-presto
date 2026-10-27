@@ -30,6 +30,11 @@ class PrestoDisplay : public display::DisplayBuffer {
   // return once it is visible. Showing one of the framebuffers makes drawing use the other.
   void show_buffer(uint16_t *buffer);
   uint32_t get_prefetch_overruns() const { return driver_->get_prefetch_overruns(); }
+  // Scroll window (presto_scroll.h). The picture is set once at boot; a window word is
+  // latched at the next frame start, and the latch count tells when an old one is gone.
+  void set_scroll_picture(uint16_t *picture) { driver_->set_window_picture(picture); }
+  void set_scroll_window(uint32_t word) { driver_->request_window(word); }
+  uint32_t get_scroll_window_latches() const { return driver_->get_window_latches(); }
 
  protected:
   void draw_absolute_pixel_internal(int x, int y, Color color) override;

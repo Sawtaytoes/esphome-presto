@@ -35,6 +35,12 @@ class PrestoRemote : public Component, public Panel {
                   const StringRef &encoded);
   void show_slot(int slot, int touch_id);
   void drop_slots();
+  // Scroll window: upload the tall picture, show it over rows [top, bottom) from its row
+  // `scroll_y`, or hide it. Reports go to Display Slot Events.
+  void scroll_chunk(int frame_id, int format, int offset, bool final_chunk,
+                    const StringRef &encoded);
+  void scroll_show(int frame_id, int top, int bottom, int scroll_y);
+  void scroll_hide();
   void touch(int phase, int x, int y);
   void controls_ack(int revision, int backlight);
   // CastKit's commanded level. Zero is dark, but a press still lights the panel at the wake level.
@@ -54,6 +60,8 @@ class PrestoRemote : public Component, public Panel {
   void publish(const char *event) override;
   void publish_slot(const char *event) override;
   void publish_timing(const char *report) override;
+  void set_window(const Window &window) override;
+  void release_window() override;
   uint32_t micros() override;
   uint32_t millis() override;
   uint32_t overruns() override;
