@@ -54,6 +54,9 @@ class PrestoFrameDisplay : public PrestoDisplay {
   void set_min_report_pixels(uint32_t pixels) { min_report_pixels_ = pixels; }
   // False when no frame of at least the minimum size was presented since the last report.
   bool take_report(FrameReport &report);
+  // Experimental comparison: both modes retain the prefetch gate and write pacing.
+  void set_sram_writer(bool enabled) { sram_writer_ = enabled; }
+  bool is_sram_writer() const { return sram_writer_; }
 #ifdef USE_PRESTO_NATIVE_SCENE
   NativeScene &scene() {
     return scene_;
@@ -66,7 +69,11 @@ class PrestoFrameDisplay : public PrestoDisplay {
  protected:
   void finish_swap_();
   void paced_write_(uint8_t *to, const uint8_t *from, size_t size);
+  void paced_write_flash_(uint8_t *to, const uint8_t *from, size_t size);
+  void paced_write_sram_(uint8_t *to, const uint8_t *from, size_t size);
   void pause_();
+  void pause_flash_();
+  void pause_sram_();
   void copy_from_front_(const Rect &rect);
 
   FrameRegions regions_;
@@ -74,6 +81,7 @@ class PrestoFrameDisplay : public PrestoDisplay {
   NativeScene scene_;
 #endif
   bool swap_pending_{false};
+  bool sram_writer_{false};
   size_t batch_used_{0};
   alignas(4) uint16_t row_[480];
 
