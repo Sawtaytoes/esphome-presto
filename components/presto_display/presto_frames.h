@@ -3,6 +3,9 @@
 #ifdef USE_PRESTO_PARTIAL_FRAMES
 #include "presto_display.h"
 #include "presto_regions.h"
+#ifdef USE_PRESTO_NATIVE_SCENE
+#include "presto_scene.h"
+#endif
 #include <cstddef>
 #include <cstdint>
 
@@ -48,6 +51,11 @@ class PrestoFrameDisplay : public PrestoDisplay {
   void set_min_report_pixels(uint32_t pixels) { min_report_pixels_ = pixels; }
   // False when no frame of at least the minimum size was presented since the last report.
   bool take_report(FrameReport &report);
+#ifdef USE_PRESTO_NATIVE_SCENE
+  NativeScene &scene() {
+    return scene_;
+  }
+#endif
   // Format a report: `detail` for a text sensor, `summary` for an on-screen label.
   static void format_report(const FrameReport &report, char *detail, size_t detail_size,
                             char *summary, size_t summary_size);
@@ -59,6 +67,9 @@ class PrestoFrameDisplay : public PrestoDisplay {
   void copy_from_front_(const Rect &rect);
 
   FrameRegions regions_;
+#ifdef USE_PRESTO_NATIVE_SCENE
+  NativeScene scene_;
+#endif
   bool swap_pending_{false};
   size_t batch_used_{0};
   alignas(4) uint16_t row_[480];

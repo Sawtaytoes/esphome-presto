@@ -53,6 +53,53 @@ Native ESPHome touch coordinates are in the 480×480 logical canvas.
 
 ## LVGL
 
+### Host-supplied native scenes
+
+`examples/native-scene.yaml` adds an experimental declarative list renderer.
+After one firmware installation, a host can replace its scene through the
+encrypted `native_scene(document)` API action. Text, rows, colors, row height,
+gap, padding, and corner radius come from the host. Scrolling and momentum stay
+local to LVGL; click events carry semantic item IDs back to the host. This is
+not an HTML renderer or a remote executable-code loader.
+
+```json
+{
+  "version": 1,
+  "revision": 1,
+  "id": "sample-list",
+  "title": "Sample list",
+  "subtitle": "Scroll locally",
+  "rowHeight": 84,
+  "items": [
+    {"id": "first", "title": "First item", "detail": "Details", "value": "+10"}
+  ]
+}
+```
+
+The initial budget is 32 rows and 6,144 UTF-8 document bytes. Each item has a
+unique ASCII ID of at most 80 bytes and text fields of at most 100 bytes.
+Colors use `#RRGGBB`. Row height is 56–160, gap 0–20, and padding/radius 0–24.
+`background`, `surface`, `foreground`, `muted`, and `accent` are optional scene
+colors; each row may override its stripe with `color`. `canBack: true` makes
+the header emit a `back` click. Compiled fonts are selected in the firmware;
+replacing fonts or adding primitives still needs a firmware update.
+
+`Native Scene Status` advertises the protocol/budget and reports
+`applied,<revision>,<rows>`, or a bounded error. Revisions must increase; invalid
+or stale input leaves the current scene intact. Acknowledgement means the
+widget tree was applied, not that a frame was physically presented.
+`Native Scene Events` separately reports `click,<revision>,<id>` and
+`scroll,<revision>,<offset>` after local scrolling rests. A replacement with
+the same scene ID preserves its scroll offset. Full scene replacement is the
+only update operation in this trial; revision-checked patches are future work.
+
+The sample keeps timing diagnostics off the panel during scrolling. A header
+diagnostic can cause a separate small refresh and a copy of the prior scroll
+region between the two framebuffers; the original benchmark excluded these
+small refreshes from its timing means. Do not infer a hardware or LVGL ceiling
+from that benchmark alone. Native scene performance remains subject to board
+measurement and physical acceptance.
+
 `examples/lvgl.yaml` draws a scrolling list with ESPHome's `lvgl` component. Set
 `partial_frames: true` on the display and call the display from LVGL's draw triggers:
 

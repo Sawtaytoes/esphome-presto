@@ -13,9 +13,12 @@ PrestoFrameDisplay = ns.class_("PrestoFrameDisplay", PrestoDisplay)
 # vertical blank by `present_frame()` from LVGL's `on_draw_end`.
 CONF_PARTIAL_FRAMES = "partial_frames"
 CONF_MIN_REPORT_PIXELS = "min_report_pixels"
+CONF_NATIVE_SCENE = "native_scene"
 
 
 def _validate(config):
+    if config[CONF_NATIVE_SCENE] and not config[CONF_PARTIAL_FRAMES]:
+        raise cv.Invalid("'native_scene' needs 'partial_frames: true'")
     if not config[CONF_PARTIAL_FRAMES] and CONF_MIN_REPORT_PIXELS in config:
         raise cv.Invalid(f"'{CONF_MIN_REPORT_PIXELS}' needs '{CONF_PARTIAL_FRAMES}: true'")
     if config[CONF_PARTIAL_FRAMES] and "lambda" in config:
@@ -29,6 +32,7 @@ CONFIG_SCHEMA = cv.All(
             cv.GenerateID(): cv.declare_id(PrestoDisplay),
             cv.Optional(CONF_PARTIAL_FRAMES, default=False): cv.boolean,
             cv.Optional(CONF_MIN_REPORT_PIXELS): cv.int_range(min=0, max=480 * 480),
+            cv.Optional(CONF_NATIVE_SCENE, default=False): cv.boolean,
         }
     ).extend(cv.polling_component_schema("1s")),
     _validate,
@@ -36,6 +40,8 @@ CONFIG_SCHEMA = cv.All(
 
 
 async def to_code(config):
+    if config[CONF_NATIVE_SCENE]:
+        cg.add_define("USE_PRESTO_NATIVE_SCENE")
     if config[CONF_PARTIAL_FRAMES]:
         cg.add_define("USE_PRESTO_PARTIAL_FRAMES")
         config[CONF_ID].type = PrestoFrameDisplay
