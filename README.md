@@ -51,6 +51,99 @@ and display DMA channels; the rear lights use PIO2. Touch owns I2C1 on GPIO30/31
 with IRQ on GPIO32 and address 0x48. Do not add a second owner of that bus.
 Native ESPHome touch coordinates are in the 480×480 logical canvas.
 
+## LVGL
+
+### Host-supplied native scenes
+
+`examples/native-scene.yaml` adds an experimental declarative list renderer.
+After one firmware installation, a host can replace its scene through the
+encrypted `native_scene(document)` API action. Text, rows, colors, row height,
+gap, padding, and corner radius come from the host. Scrolling and momentum stay
+local to LVGL; click events carry semantic item IDs back to the host. This is
+not an HTML renderer or a remote executable-code loader.
+
+```json
+{
+  "version": 1,
+  "revision": 1,
+  "id": "sample-list",
+  "title": "Sample list",
+  "subtitle": "Scroll locally",
+  "rowHeight": 84,
+  "items": [
+    {"id": "first", "title": "First item", "detail": "Details", "value": "+10"}
+  ]
+}
+```
+
+The initial budget is 32 rows and 6,144 UTF-8 document bytes. Each item has a
+unique ASCII ID of at most 80 bytes and text fields of at most 100 bytes.
+Colors use `#RRGGBB`. Row height is 56–160, gap 0–20, and padding/radius 0–24.
+`background`, `surface`, `foreground`, `muted`, and `accent` are optional scene
+colors; each row may override its stripe with `color`. `canBack: true` makes
+the header emit a `back` click. Compiled fonts are selected in the firmware;
+replacing fonts or adding primitives still needs a firmware update.
+
+`Native Scene Status` advertises the protocol/budget and reports
+`applied,<revision>,<rows>`, or a bounded error. Revisions must increase; invalid
+or stale input leaves the current scene intact. Acknowledgement means the
+widget tree was applied, not that a frame was physically presented.
+`Native Scene Events` separately reports `click,<revision>,<id>` and
+`scroll,<revision>,<offset>` after local scrolling rests. A replacement with
+the same scene ID preserves its scroll offset. Full scene replacement is the
+only update operation in this trial; revision-checked patches are future work.
+
+The sample keeps timing diagnostics off the panel during scrolling. A header
+diagnostic can cause a separate small refresh and a copy of the prior scroll
+region between the two framebuffers; the original benchmark excluded these
+small refreshes from its timing means. Do not infer a hardware or LVGL ceiling
+from that benchmark alone. Native scene performance remains subject to board
+measurement and physical acceptance.
+
+`examples/lvgl.yaml` draws a scrolling list with ESPHome's `lvgl` component. Set
+`partial_frames: true` on the display and call the display from LVGL's draw triggers:
+
+```yaml
+display:
+  - platform: presto_display
+    id: presto_lcd
+    update_interval: never
+    partial_frames: true
+lvgl:
+  displays: [presto_lcd]
+  buffer_size: 12%
+  on_draw_start:
+    - lambda: id(presto_lcd).begin_frame();
+  on_draw_end:
+    - lambda: id(presto_lcd).present_frame();
+```
+
+LVGL renders each strip in an SRAM draw buffer (`buffer_size: 12%` is 60 full-width
+rows, 57,600 bytes). The display copies the strip into the back framebuffer with the
+receiver's PSRAM rules: wait for the scanout's row prefetch, write at most 960 bytes,
+then pause 50 µs. Rows narrower than the panel share a batch. ESPHome's generic
+per-pixel path is never used, because it writes PSRAM unpaced. `present_frame()` swaps
+at the next vertical blank; the next write waits for that blank, so LVGL renders the
+next strip meanwhile. A frame that drew nothing presents nothing.
+
+LVGL redraws only what changed, and the back framebuffer still holds the frame before
+last. So before a swap the display copies, from the visible framebuffer, the areas the
+previous frame drew minus the areas this frame drew (`presto_regions.h`, tested by
+`tests/test_regions.py`). A steady scroll redraws the same area every frame and copies
+nothing. Keep LVGL's default `byte_order: big_endian`: the framebuffer holds big-endian
+RGB565, so the rows are copied as they are.
+
+`take_report()` returns the timing of the frames presented since the last call: frames
+per second over back-to-back frames, and the mean frame time split into rendering,
+PSRAM writes, the wait for vertical blank, the stale-area copy, and the swap
+preparation, plus the scanout prefetch overruns. Frames smaller than
+`min_report_pixels` (480×48 by default) are counted but left out, so a label that shows
+the report does not report its own redraw. Every pixel LVGL changes costs a paced
+write, so a full-height scroll is bound by PSRAM write time rather than by rendering.
+`partial_frames` cannot be combined with the CastKit receiver; both draw the back buffer.
+SRAM is the other limit: the scanout's row cache takes about 250 KB of heap at boot,
+and LVGL's draw buffer and widgets come out of what is left.
+
 ## CastKit receiver
 
 `examples/castkit.yaml` supplies the encrypted API actions for CastKit's remote
@@ -228,11 +321,12 @@ python -m unittest discover -s tests
 esphome compile examples/display-test.yaml
 esphome compile examples/hardware-test.yaml
 esphome compile examples/castkit.yaml
+esphome compile examples/lvgl.yaml
 ```
 
 The receiver and decoder tests compile and execute the actual C++, miniz, and JPEGDEC
 code on the host; they require `g++`, and the JPEG tests require Pillow
-(`pip install pillow`) to encode their synthetic images. CI compiles all three firmware examples and checks the
+(`pip install pillow`) to encode their synthetic images. CI compiles all four firmware examples and checks the
 project's Python and C++ formatting. Vendored code retains upstream formatting.
 See [UPSTREAM.md](UPSTREAM.md) for licenses, pinned sources and adaptations.
 

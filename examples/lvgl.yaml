@@ -1,0 +1,202 @@
+# A 40-row scrolling list drawn on the board with LVGL, with frame timing on screen and
+# on the "LVGL Frame Timing" text sensor. Tap the header (or press "LVGL Scroll
+# Benchmark") to scroll to the bottom and back at a steady speed.
+esphome:
+  name: presto-lvgl
+  friendly_name: Presto LVGL
+  platformio_options:
+    board_build.flash_size: 16777216
+    board_upload.maximum_size: 16777216
+  on_boot:
+    - priority: -100
+      then:
+        # Forty rows of one shape, which yaml cannot loop over.
+        - lambda: |-
+            static constexpr uint32_t FIXED = LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE;
+            static const uint32_t ART[] = {0x3E5C76, 0x8C5A3C, 0x4F7A5A, 0x6A4C93};
+            lv_obj_t *list = id(item_list);
+            lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_style_pad_row(list, 7, LV_PART_MAIN);
+            for (int i = 0; i < 40; ++i) {
+              lv_obj_t *row = lv_obj_create(list);
+              lv_obj_remove_style_all(row);
+              lv_obj_add_style(row, id(row_style), LV_PART_MAIN);
+              lv_obj_remove_flag(row, static_cast<lv_obj_flag_t>(FIXED));
+              lv_obj_set_size(row, lv_pct(100), 58);
+              lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+              lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                                    LV_FLEX_ALIGN_CENTER);
+              lv_obj_t *art = lv_obj_create(row);
+              lv_obj_remove_style_all(art);
+              lv_obj_add_style(art, id(art_style), LV_PART_MAIN);
+              lv_obj_remove_flag(art, static_cast<lv_obj_flag_t>(FIXED));
+              lv_obj_set_size(art, 43, 43);
+              lv_obj_set_style_bg_color(art, lv_color_hex(ART[i % 4]), LV_PART_MAIN);
+              lv_obj_t *track = lv_obj_create(row);
+              lv_obj_remove_style_all(track);
+              lv_obj_remove_flag(track, static_cast<lv_obj_flag_t>(FIXED));
+              lv_obj_set_size(track, 1, LV_SIZE_CONTENT);
+              lv_obj_set_flex_grow(track, 1);
+              lv_obj_set_flex_flow(track, LV_FLEX_FLOW_COLUMN);
+              lv_obj_t *title = lv_label_create(track);
+              lv_obj_add_style(title, id(title_style), LV_PART_MAIN);
+              lv_label_set_text_fmt(title, "Track %d", i + 1);
+              lv_obj_t *detail = lv_label_create(track);
+              lv_obj_add_style(detail, id(detail_style), LV_PART_MAIN);
+              lv_label_set_text(detail, "Example artist");
+            }
+        - lambda: id(presto_lcd).set_brightness(0.6f);
+rp2:
+  board: pimoroni_pico_plus_2w
+  variant: rp2350
+logger:
+external_components:
+  - source:
+      type: local
+      path: ../components
+wifi:
+  ssid: !secret 'wifi_ssid'
+  password: !secret 'wifi_password'
+  power_save_mode: none
+api:
+  encryption:
+    key: !secret 'api_encryption_key'
+  reboot_timeout: 0s
+ota:
+  - platform: esphome
+    encryption: {}
+    on_begin:
+      - lambda: id(presto_lcd).pause_scanout();
+    on_error:
+      - lambda: App.safe_reboot();
+display:
+  - platform: presto_display
+    id: presto_lcd
+    update_interval: never
+    partial_frames: true
+touchscreen:
+  - platform: presto_display
+    id: presto_touch
+    display: presto_lcd
+    update_interval: 20ms
+font:
+  - id: sans_12
+    file: "gfonts://Outfit@600"
+    size: 12
+    bpp: 4
+  - id: sans_15
+    file: "gfonts://Outfit@600"
+    size: 15
+    bpp: 4
+text_sensor:
+  - platform: template
+    name: LVGL Frame Timing
+    id: frame_timing
+    update_interval: never
+    entity_category: diagnostic
+button:
+  - platform: template
+    name: LVGL Scroll Benchmark
+    entity_category: diagnostic
+    on_press:
+      - script.execute: scroll_benchmark
+script:
+  - id: scroll_benchmark
+    then:
+      - lambda: |-
+          lv_obj_t *list = id(item_list);
+          lv_obj_update_layout(list);
+          lv_anim_delete(list, nullptr);
+          lv_anim_t anim;
+          lv_anim_init(&anim);
+          lv_anim_set_var(&anim, list);
+          lv_anim_set_values(&anim, 0,
+                             lv_obj_get_scroll_y(list) + lv_obj_get_scroll_bottom(list));
+          lv_anim_set_duration(&anim, 6000);
+          lv_anim_set_reverse_duration(&anim, 6000);
+          lv_anim_set_path_cb(&anim, lv_anim_path_linear);
+          lv_anim_set_exec_cb(&anim, [](void *obj, int32_t y) {
+            lv_obj_scroll_to_y(static_cast<lv_obj_t *>(obj), y, LV_ANIM_OFF);
+          });
+          lv_anim_start(&anim);
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          esphome::presto_display::FrameReport report;
+          if (!id(presto_lcd).take_report(report)) return;
+          char detail[200], summary[48];
+          esphome::presto_display::PrestoFrameDisplay::format_report(
+              report, detail, sizeof(detail), summary, sizeof(summary));
+          id(frame_timing).publish_state(detail);
+          lv_label_set_text(id(timing_label), summary);
+lvgl:
+  displays:
+    - presto_lcd
+  touchscreens:
+    - touchscreen_id: presto_touch
+  buffer_size: 12%
+  bg_color: 0x131822
+  on_draw_start:
+    - lambda: id(presto_lcd).begin_frame();
+  on_draw_end:
+    - lambda: id(presto_lcd).present_frame();
+  theme:
+    obj:
+      bg_opa: TRANSP
+      border_width: 0
+      radius: 0
+      pad_all: 0
+  style_definitions:
+    - id: row_style
+      border_side: BOTTOM
+      border_width: 1
+      border_color: 0x212936
+      pad_left: 10
+      pad_right: 10
+      pad_column: 12
+    - id: art_style
+      radius: 5
+      bg_opa: COVER
+    - id: title_style
+      text_font: sans_15
+      text_color: 0xEDF0F5
+    - id: detail_style
+      text_font: sans_12
+      text_color: 0xA9B2C1
+  widgets:
+    - obj:
+        width: 480
+        height: 40
+        pad_left: 24
+        pad_right: 24
+        scrollable: false
+        layout:
+          type: FLEX
+          flex_flow: ROW
+          flex_align_main: SPACE_BETWEEN
+          flex_align_cross: CENTER
+          flex_align_track: CENTER
+        on_click:
+          - script.execute: scroll_benchmark
+        widgets:
+          - label:
+              text: List
+              text_font: sans_15
+              text_color: 0xEDF0F5
+          - label:
+              id: timing_label
+              text: tap to benchmark
+              text_font: sans_12
+              text_color: 0x8B94A5
+    - obj:
+        id: item_list
+        y: 40
+        width: 480
+        height: 440
+        pad_left: 14
+        pad_right: 14
+        pad_top: 4
+        pad_bottom: 14
+        scroll_dir: VER
+        scrollbar_mode: "OFF"

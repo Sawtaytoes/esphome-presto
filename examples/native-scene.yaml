@@ -1,0 +1,166 @@
+# A runtime list supplied by a host over the encrypted ESPHome API. Flash once,
+# then replace text, rows, colors, and spacing with the native_scene action.
+esphome:
+  name: presto-native-scene
+  friendly_name: Presto Native Scene
+  compile_process_limit: 2
+  platformio_options:
+    board_build.flash_size: 16777216
+    board_upload.maximum_size: 16777216
+  on_boot:
+    - priority: -100
+      then:
+        - lambda: |-
+            id(presto_lcd).scene().setup(
+                lv_screen_active(),
+                lv_obj_get_style_text_font(id(title_font_probe), LV_PART_MAIN),
+                lv_obj_get_style_text_font(id(body_font_probe), LV_PART_MAIN),
+                lv_obj_get_style_text_font(id(detail_font_probe), LV_PART_MAIN),
+                [](const std::string &s) { id(scene_status).publish_state(s); },
+                [](const std::string &s) { id(scene_events).publish_state(s); });
+rp2:
+  board: pimoroni_pico_plus_2w
+  variant: rp2350
+logger:
+  level: INFO
+external_components:
+  - source:
+      type: local
+      path: ../components
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+json:
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s
+  actions:
+    - action: native_scene
+      variables:
+        document: string
+      then:
+        - lambda: id(presto_lcd).scene().apply(document);
+    - action: native_scroll
+      variables:
+        offset: int
+      then:
+        - lambda: id(presto_lcd).scene().scroll_to(offset);
+ota:
+  - platform: esphome
+    encryption: {}
+    on_begin:
+      - lambda: id(presto_lcd).pause_scanout();
+    on_error:
+      - lambda: App.safe_reboot();
+display:
+  - platform: presto_display
+    id: presto_lcd
+    update_interval: never
+    partial_frames: true
+    native_scene: true
+touchscreen:
+  - platform: presto_display
+    id: presto_touch
+    display: presto_lcd
+    update_interval: 20ms
+output:
+  - platform: presto_display
+    id: backlight_output
+    display_id: presto_lcd
+light:
+  - platform: monochromatic
+    id: lcd_backlight
+    name: Backlight
+    output: backlight_output
+    restore_mode: RESTORE_DEFAULT_OFF
+font:
+  - id: scene_title_font
+    file: "gfonts://Outfit@700"
+    size: 24
+    bpp: 2
+  - id: scene_body_font
+    file: "gfonts://Outfit@600"
+    size: 20
+    bpp: 2
+  - id: scene_detail_font
+    file: "gfonts://Outfit@600"
+    size: 15
+    bpp: 2
+text_sensor:
+  - platform: template
+    name: Native Scene Status
+    id: scene_status
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    name: Native Scene Events
+    id: scene_events
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    name: LVGL Frame Timing
+    id: frame_timing
+    update_interval: never
+    entity_category: diagnostic
+button:
+  - platform: template
+    name: LVGL Scroll Benchmark
+    entity_category: diagnostic
+    on_press:
+      - lambda: id(presto_lcd).scene().benchmark();
+interval:
+  - interval: 2s
+    then:
+      - lambda: |-
+          esphome::presto_display::FrameReport report;
+          if (!id(presto_lcd).take_report(report)) return;
+          char detail[200], summary[48];
+          esphome::presto_display::PrestoFrameDisplay::format_report(
+              report, detail, sizeof(detail), summary, sizeof(summary));
+          id(frame_timing).publish_state(detail);
+          // Keep diagnostics off the screen: otherwise a small header refresh
+          // copies the preceding scroll region between the framebuffers.
+lvgl:
+  displays: [presto_lcd]
+  touchscreens:
+    - touchscreen_id: presto_touch
+  buffer_size: 12%
+  byte_order: big_endian
+  bg_color: 0x131822
+  on_draw_start:
+    - lambda: id(presto_lcd).begin_frame();
+  on_draw_end:
+    - lambda: id(presto_lcd).present_frame();
+  widgets:
+    # Enable LVGL's flex primitive for the lists created by the runtime scene.
+    - obj:
+        hidden: true
+        width: 1
+        height: 1
+        layout:
+          type: FLEX
+          flex_flow: COLUMN
+        widgets: []
+    - label:
+        id: title_font_probe
+        text: "Waiting for a CastKit scene"
+        text_font: scene_title_font
+        text_color: 0xEDF0F5
+        x: 16
+        y: 24
+    - label:
+        id: body_font_probe
+        text: "Native list renderer ready"
+        text_font: scene_body_font
+        text_color: 0xA9B2C1
+        x: 16
+        y: 64
+    - label:
+        id: detail_font_probe
+        text: "Layout and data arrive through the encrypted API."
+        text_font: scene_detail_font
+        text_color: 0xA9B2C1
+        x: 16
+        y: 100

@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        example: [display-test, hardware-test, castkit]
+        example: [display-test, hardware-test, castkit, lvgl, native-scene]
     steps:
       - uses: actions/checkout@v7
       - name: Supply build-only example secrets
