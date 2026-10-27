@@ -129,8 +129,8 @@ void __not_in_flash_func(PrestoFrameDisplay::pause_sram_)() {
   batch_used_ = 0;
 }
 
-void __not_in_flash_func(PrestoFrameDisplay::paced_write_sram_)(
-    uint8_t *to, const uint8_t *from, size_t size) {
+void __not_in_flash_func(PrestoFrameDisplay::paced_write_sram_)(uint8_t *to, const uint8_t *from,
+                                                                size_t size) {
   // may_alias permits word copies of RGB565/byte buffers. Volatile stores prevent
   // the compiler replacing these loops with a call to the flash memcpy wrapper.
   typedef uint32_t __attribute__((__may_alias__)) Word;
