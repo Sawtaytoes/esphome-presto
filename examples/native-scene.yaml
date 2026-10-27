@@ -98,7 +98,7 @@ text_sensor:
     name: Native Scene Events
     id: scene_events
     update_interval: never
-    internal: true
+    entity_category: diagnostic
   - platform: template
     name: LVGL Frame Timing
     id: frame_timing
