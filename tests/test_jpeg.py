@@ -263,6 +263,25 @@ class JpegPatchTests(unittest.TestCase):
                     self.assert_ack(frame_id)
                     before = self.assert_patch(before, CAMERA, jpeg, sampling)
 
+    def test_a_camera_patch_reaches_psram_in_whole_rows(self):
+        # Every PSRAM write pays the scanout gate and the pacing pause, so a 4:2:0 patch
+        # must not go out as JPEGDEC's 128-pixel strips: 1572 calls for this patch before, 155 now.
+        before = self.show_full()
+        jpeg = encode(texture(480, 360), sampling="4:2:0")
+        calls = self.board.write_calls()
+        self.send_jpeg(2, 1, CAMERA, jpeg)
+        self.assert_ack(2)
+        self.assertLess(self.board.write_calls() - calls, 200)
+        self.assert_patch(before, CAMERA, jpeg)
+
+    def test_a_partial_width_patch_is_exact_around_its_rectangle(self):
+        before = self.show_full()
+        rect = (40, 24, 200, 72)
+        jpeg = encode(gradient(200, 72), sampling="4:2:0")
+        self.send_jpeg(2, 1, rect, jpeg)
+        self.assert_ack(2)
+        self.assert_patch(before, rect, jpeg)
+
     def test_noise_patch(self):
         before = self.show_full()
         rect = (120, 160, 240, 160)

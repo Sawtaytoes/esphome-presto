@@ -114,7 +114,11 @@ The body is collected in a 128 KiB PSRAM buffer allocated once at boot, through 
 paced writer as every other PSRAM write, and read back behind the prefetch gate. On the
 final chunk the receiver checks it marker by marker, then decodes it with JPEGDEC
 (about 18 KB of SRAM state, allocated once), which hands back blocks of big-endian RGB565
-that are clipped to the rectangle and written row by row through the paced writer. The
+that are clipped to the rectangle. JPEGDEC's blocks are at most 2048 pixels (a 4:2:0 MCU row
+arrives as 128-pixel strips), and every paced write pays the prefetch gate and the pause
+however short it is, so one MCU row of the rectangle is gathered in a 15 KB SRAM band first
+and written as whole rows (one contiguous run for a full-width patch). A 480x360 camera patch
+went from 1572 write calls to 155, and its PSRAM write time on a board from about 161 ms. The
 decode runs in one piece inside the final chunk's action; touch polling continues during its
 paced writes. The `<decode µs>` of the acknowledgement includes it. JPEGDEC repeats each
 subsampled chroma sample over its block instead of interpolating, so a 4:2:0 color edge is
