@@ -12,6 +12,7 @@ class PrestoTouch : public touchscreen::Touchscreen {
     max_sample_gap_us_ = 0;
     return result;
   }
+  void reset_sample_gap() { last_sample_us_ = max_sample_gap_us_ = 0; }
 
  protected:
   void update_touches() override;

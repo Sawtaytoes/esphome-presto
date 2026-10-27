@@ -55,7 +55,7 @@ class PrestoFrameDisplay : public PrestoDisplay {
   // False when no frame of at least the minimum size was presented since the last report.
   bool take_report(FrameReport &report);
   // Experimental comparison: both modes retain the prefetch gate and write pacing.
-  void set_sram_writer(bool enabled) { sram_writer_ = enabled; }
+  void set_sram_writer(bool enabled);
   bool is_sram_writer() const { return sram_writer_; }
 #ifdef USE_PRESTO_NATIVE_SCENE
   NativeScene &scene() {
@@ -75,6 +75,7 @@ class PrestoFrameDisplay : public PrestoDisplay {
   void pause_flash_();
   void pause_sram_();
   void copy_from_front_(const Rect &rect);
+  void clear_report_();
 
   FrameRegions regions_;
 #ifdef USE_PRESTO_NATIVE_SCENE

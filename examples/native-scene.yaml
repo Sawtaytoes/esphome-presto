@@ -52,7 +52,11 @@ api:
       variables:
         enabled: bool
       then:
-        - lambda: id(presto_lcd).set_sram_writer(enabled);
+        - lambda: |-
+            if (id(presto_lcd).is_sram_writer() != enabled) {
+              id(presto_lcd).set_sram_writer(enabled);
+              id(presto_touch).reset_sample_gap();
+            }
 ota:
   - platform: esphome
     encryption: {}

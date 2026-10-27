@@ -40,6 +40,19 @@ void PrestoFrameDisplay::begin_frame() {
   }
 }
 
+void PrestoFrameDisplay::set_sram_writer(bool enabled) {
+  if (enabled == sram_writer_) {
+    return;
+  }
+  // The native API calls this between refreshes. Finish any pending batch using
+  // its original pacing path, then start an uncontaminated measurement window.
+  pause_();
+  sram_writer_ = enabled;
+  clear_report_();
+  has_last_present_ = false;
+  window_overruns_start_ = get_prefetch_overruns();
+}
+
 // The swap requested by present_frame() happens at the next vertical blank. Until then the
 // new back framebuffer is still on the glass, so every write waits here first.
 void PrestoFrameDisplay::finish_swap_() {
@@ -300,12 +313,16 @@ bool PrestoFrameDisplay::take_report(FrameReport &report) {
   report.max_gate_us = max_gate_us_;
   report.max_interval_us = max_interval_us_;
   window_overruns_start_ = report.overruns;
+  clear_report_();
+  return true;
+}
+
+void PrestoFrameDisplay::clear_report_() {
   frames_ = small_frames_ = intervals_ = max_frame_us_ = 0;
   interval_sum_us_ = frame_sum_us_ = write_sum_us_ = vsync_sum_us_ = sync_sum_us_ =
       present_sum_us_ = pixel_sum_ = 0;
   gate_sum_us_ = copy_sum_us_ = pace_sum_us_ = 0;
   max_gate_us_ = max_interval_us_ = 0;
-  return true;
 }
 
 void PrestoFrameDisplay::format_report(const FrameReport &report, char *detail, size_t detail_size,
