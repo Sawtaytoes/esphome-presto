@@ -49,6 +49,11 @@ void PrestoTouch::dump_config() {
   ESP_LOGCONFIG("presto_touch", "Presto touch: I2C1 SDA30 SCL31 INT32, address 0x48");
 }
 void PrestoTouch::update_touches() {
+  const uint32_t now = time_us_32();
+  if (last_sample_us_) {
+    max_sample_gap_us_ = std::max(max_sample_gap_us_, now - last_sample_us_);
+  }
+  last_sample_us_ = now;
   if (int32_t(millis() - retry_at_) < 0) {
     return;
   }

@@ -18,7 +18,7 @@ struct FrameReport {
   float fps{0}; // over back-to-back frames only; 0 when there were none
   uint32_t frame_us{0}; // mean, from LVGL's render start to the swap request
   uint32_t max_frame_us{0};
-  uint32_t render_us{0}; // mean CPU time: the frame minus every figure below
+  uint32_t render_us{0}; // elapsed remainder, including rendering and scheduling
   uint32_t write_us{0}; // mean paced PSRAM writes of the drawn pixels
   uint32_t vsync_us{0}; // mean wait for the previous frame's vertical blank
   uint32_t sync_us{0}; // mean copy of stale areas from the visible framebuffer
@@ -26,6 +26,9 @@ struct FrameReport {
   uint32_t pixels{0}; // mean pixels drawn per frame
   uint32_t overruns{0}; // scanout prefetch overruns since boot
   uint32_t window_overruns{0}; // prefetch overruns during the report window
+  uint32_t gate_us{0}, copy_us{0}, pace_us{0}; // all paced writes, including stale sync
+  uint32_t max_gate_us{0};
+  uint32_t max_interval_us{0}; // intervals between eligible frames, including idle gaps
 };
 
 // The display for LVGL's partial renderer (`partial_frames: true`). LVGL draws each strip
@@ -51,6 +54,9 @@ class PrestoFrameDisplay : public PrestoDisplay {
   void set_min_report_pixels(uint32_t pixels) { min_report_pixels_ = pixels; }
   // False when no frame of at least the minimum size was presented since the last report.
   bool take_report(FrameReport &report);
+  // Experimental comparison: both modes retain the prefetch gate and write pacing.
+  void set_sram_writer(bool enabled);
+  bool is_sram_writer() const { return sram_writer_; }
 #ifdef USE_PRESTO_NATIVE_SCENE
   NativeScene &scene() {
     return scene_;
@@ -63,14 +69,20 @@ class PrestoFrameDisplay : public PrestoDisplay {
  protected:
   void finish_swap_();
   void paced_write_(uint8_t *to, const uint8_t *from, size_t size);
+  void paced_write_flash_(uint8_t *to, const uint8_t *from, size_t size);
+  void paced_write_sram_(uint8_t *to, const uint8_t *from, size_t size);
   void pause_();
+  void pause_flash_();
+  void pause_sram_();
   void copy_from_front_(const Rect &rect);
+  void clear_report_();
 
   FrameRegions regions_;
 #ifdef USE_PRESTO_NATIVE_SCENE
   NativeScene scene_;
 #endif
   bool swap_pending_{false};
+  bool sram_writer_{false};
   size_t batch_used_{0};
   alignas(4) uint16_t row_[480];
 
@@ -78,6 +90,10 @@ class PrestoFrameDisplay : public PrestoDisplay {
   uint32_t frame_start_us_{0};
   bool is_frame_started_{false};
   uint32_t frame_write_us_{0}, frame_vsync_us_{0}, frame_pixels_{0};
+  uint32_t frame_gate_us_{0}, frame_copy_us_{0}, frame_pace_us_{0};
+  uint32_t frame_max_gate_us_{0};
+  uint32_t max_gate_us_{0}, max_interval_us_{0};
+  uint64_t gate_sum_us_{0}, copy_sum_us_{0}, pace_sum_us_{0};
   // The report window.
   uint32_t last_present_us_{0};
   bool has_last_present_{false};

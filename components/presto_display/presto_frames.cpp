@@ -40,6 +40,19 @@ void PrestoFrameDisplay::begin_frame() {
   }
 }
 
+void PrestoFrameDisplay::set_sram_writer(bool enabled) {
+  if (enabled == sram_writer_) {
+    return;
+  }
+  // The native API calls this between refreshes. Finish any pending batch using
+  // its original pacing path, then start an uncontaminated measurement window.
+  pause_();
+  sram_writer_ = enabled;
+  clear_report_();
+  has_last_present_ = false;
+  window_overruns_start_ = get_prefetch_overruns();
+}
+
 // The swap requested by present_frame() happens at the next vertical blank. Until then the
 // new back framebuffer is still on the glass, so every write waits here first.
 void PrestoFrameDisplay::finish_swap_() {
@@ -50,12 +63,22 @@ void PrestoFrameDisplay::finish_swap_() {
 }
 
 void PrestoFrameDisplay::pause_() {
+  if (sram_writer_) {
+    pause_sram_();
+  } else {
+    pause_flash_();
+  }
+}
+
+void PrestoFrameDisplay::pause_flash_() {
   if (batch_used_ == 0) {
     return;
   }
 #if PRESTO_PACE_US > 0
   // Give the lower-priority XIP streaming hardware a QMI service window.
+  const uint32_t start = time_us_32();
   sleep_us(PRESTO_PACE_US);
+  frame_pace_us_ += time_us_32() - start;
 #endif
   batch_used_ = 0;
 }
@@ -63,16 +86,85 @@ void PrestoFrameDisplay::pause_() {
 // SRAM -> PSRAM behind the prefetch gate, at most PRESTO_WRITE_BATCH bytes between pauses.
 // Short rows share a batch, so a narrow strip pays one pause per 960 bytes, not per row.
 void PrestoFrameDisplay::paced_write_(uint8_t *to, const uint8_t *from, size_t size) {
+  if (sram_writer_) {
+    paced_write_sram_(to, from, size);
+  } else {
+    paced_write_flash_(to, from, size);
+  }
+}
+
+void PrestoFrameDisplay::paced_write_flash_(uint8_t *to, const uint8_t *from, size_t size) {
   while (size) {
     const size_t count = std::min(size, size_t(PRESTO_WRITE_BATCH) - batch_used_);
+    const uint32_t gate_start = time_us_32();
     wait_for_prefetch();
+    const uint32_t copy_start = time_us_32();
+    const uint32_t gate_us = copy_start - gate_start;
+    frame_gate_us_ += gate_us;
+    frame_max_gate_us_ = std::max(frame_max_gate_us_, gate_us);
     memcpy(to, from, count);
+    frame_copy_us_ += time_us_32() - copy_start;
     to += count;
     from += count;
     size -= count;
     batch_used_ += count;
     if (batch_used_ >= size_t(PRESTO_WRITE_BATCH)) {
-      pause_();
+      pause_flash_();
+    }
+  }
+}
+
+void __not_in_flash_func(PrestoFrameDisplay::pause_sram_)() {
+  if (batch_used_ == 0) {
+    return;
+  }
+#if PRESTO_PACE_US > 0
+  const uint32_t start = time_us_32();
+  // Use only the inline hardware timer here: sleep_us calls back into XIP flash.
+  while (time_us_32() - start < PRESTO_PACE_US) {
+    __asm volatile("nop");
+  }
+  frame_pace_us_ += time_us_32() - start;
+#endif
+  batch_used_ = 0;
+}
+
+void __not_in_flash_func(PrestoFrameDisplay::paced_write_sram_)(uint8_t *to, const uint8_t *from,
+                                                                size_t size) {
+  // may_alias permits word copies of RGB565/byte buffers. Volatile stores prevent
+  // the compiler replacing these loops with a call to the flash memcpy wrapper.
+  typedef uint32_t __attribute__((__may_alias__)) Word;
+  typedef uint16_t __attribute__((__may_alias__)) Half;
+  while (size) {
+    const size_t count = std::min(size, size_t(PRESTO_WRITE_BATCH) - batch_used_);
+    const uint32_t gate_start = time_us_32();
+    wait_for_prefetch();
+    const uint32_t copy_start = time_us_32();
+    const uint32_t gate_us = copy_start - gate_start;
+    frame_gate_us_ += gate_us;
+    frame_max_gate_us_ = std::max(frame_max_gate_us_, gate_us);
+    size_t offset = 0;
+    if (((uintptr_t(to) | uintptr_t(from)) & 3) == 0) {
+      for (; offset + 4 <= count; offset += 4) {
+        *reinterpret_cast<volatile Word *>(to + offset) =
+            *reinterpret_cast<const Word *>(from + offset);
+      }
+    } else if (((uintptr_t(to) | uintptr_t(from)) & 1) == 0) {
+      for (; offset + 2 <= count; offset += 2) {
+        *reinterpret_cast<volatile Half *>(to + offset) =
+            *reinterpret_cast<const Half *>(from + offset);
+      }
+    }
+    for (; offset < count; ++offset) {
+      *reinterpret_cast<volatile uint8_t *>(to + offset) = from[offset];
+    }
+    frame_copy_us_ += time_us_32() - copy_start;
+    to += count;
+    from += count;
+    size -= count;
+    batch_used_ += count;
+    if (batch_used_ >= size_t(PRESTO_WRITE_BATCH)) {
+      pause_sram_();
     }
   }
 }
@@ -176,6 +268,13 @@ void PrestoFrameDisplay::present_frame() {
     sync_sum_us_ += present_start - sync_start;
     present_sum_us_ += now - present_start;
     pixel_sum_ += frame_pixels_;
+    gate_sum_us_ += frame_gate_us_;
+    copy_sum_us_ += frame_copy_us_;
+    pace_sum_us_ += frame_pace_us_;
+    max_gate_us_ = std::max(max_gate_us_, frame_max_gate_us_);
+    if (has_last_present_) {
+      max_interval_us_ = std::max(max_interval_us_, now - last_present_us_);
+    }
     if (has_last_present_ && now - last_present_us_ < BURST_GAP_US) {
       ++intervals_;
       interval_sum_us_ += now - last_present_us_;
@@ -185,6 +284,8 @@ void PrestoFrameDisplay::present_frame() {
   }
   is_frame_started_ = false;
   frame_write_us_ = frame_vsync_us_ = frame_pixels_ = 0;
+  frame_gate_us_ = frame_copy_us_ = frame_pace_us_ = 0;
+  frame_max_gate_us_ = 0;
 }
 
 bool PrestoFrameDisplay::take_report(FrameReport &report) {
@@ -206,11 +307,22 @@ bool PrestoFrameDisplay::take_report(FrameReport &report) {
   report.pixels = mean(pixel_sum_);
   report.overruns = get_prefetch_overruns();
   report.window_overruns = report.overruns - window_overruns_start_;
+  report.gate_us = mean(gate_sum_us_);
+  report.copy_us = mean(copy_sum_us_);
+  report.pace_us = mean(pace_sum_us_);
+  report.max_gate_us = max_gate_us_;
+  report.max_interval_us = max_interval_us_;
   window_overruns_start_ = report.overruns;
+  clear_report_();
+  return true;
+}
+
+void PrestoFrameDisplay::clear_report_() {
   frames_ = small_frames_ = intervals_ = max_frame_us_ = 0;
   interval_sum_us_ = frame_sum_us_ = write_sum_us_ = vsync_sum_us_ = sync_sum_us_ =
       present_sum_us_ = pixel_sum_ = 0;
-  return true;
+  gate_sum_us_ = copy_sum_us_ = pace_sum_us_ = 0;
+  max_gate_us_ = max_interval_us_ = 0;
 }
 
 void PrestoFrameDisplay::format_report(const FrameReport &report, char *detail, size_t detail_size,
@@ -218,11 +330,14 @@ void PrestoFrameDisplay::format_report(const FrameReport &report, char *detail, 
   const auto ms = [](uint32_t us) { return us / 1000.0f; };
   snprintf(detail, detail_size,
            "fps=%.1f frame=%.1fms max=%.1fms render=%.1f write=%.1f vsync=%.1f sync=%.1f "
-           "present=%.1f px=%u frames=%u small=%u overruns=%u(+%u)",
+           "present=%.1f px=%u frames=%u small=%u overruns=%u(+%u) "
+           "gate=%.1f copy=%.1f pace=%.1f gateMax=%.1f intervalMax=%.1f",
            report.fps, ms(report.frame_us), ms(report.max_frame_us), ms(report.render_us),
            ms(report.write_us), ms(report.vsync_us), ms(report.sync_us), ms(report.present_us),
            unsigned(report.pixels), unsigned(report.frames), unsigned(report.small_frames),
-           unsigned(report.overruns), unsigned(report.window_overruns));
+           unsigned(report.overruns), unsigned(report.window_overruns), ms(report.gate_us),
+           ms(report.copy_us), ms(report.pace_us), ms(report.max_gate_us),
+           ms(report.max_interval_us));
   if (report.fps > 0) {
     snprintf(summary, summary_size, "%.1f fps  %u ms  ovr %u", report.fps,
              unsigned((report.frame_us + 500) / 1000), unsigned(report.overruns));

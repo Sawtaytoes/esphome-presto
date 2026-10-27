@@ -11,6 +11,7 @@ esphome:
     - priority: -100
       then:
         - lambda: |-
+            id(presto_lcd).set_min_report_pixels(0);
             id(presto_lcd).scene().setup(
                 lv_screen_active(),
                 lv_obj_get_style_text_font(id(title_font_probe), LV_PART_MAIN),
@@ -47,6 +48,15 @@ api:
         offset: int
       then:
         - lambda: id(presto_lcd).scene().scroll_to(offset);
+    - action: native_sram_writer
+      variables:
+        enabled: bool
+      then:
+        - lambda: |-
+            if (id(presto_lcd).is_sram_writer() != enabled) {
+              id(presto_lcd).set_sram_writer(enabled);
+              id(presto_touch).reset_sample_gap();
+            }
 ota:
   - platform: esphome
     encryption: {}
@@ -116,10 +126,13 @@ interval:
       - lambda: |-
           esphome::presto_display::FrameReport report;
           if (!id(presto_lcd).take_report(report)) return;
-          char detail[200], summary[48];
+          char detail[320], summary[48];
           esphome::presto_display::PrestoFrameDisplay::format_report(
               report, detail, sizeof(detail), summary, sizeof(summary));
-          id(frame_timing).publish_state(detail);
+          id(frame_timing).publish_state(std::string(detail) +
+              " sampleGap=" + std::to_string(id(presto_touch).take_max_sample_gap_us() / 1000) +
+              "ms heap=" + std::to_string(rp2040.getFreeHeap()) +
+              " writer=" + (id(presto_lcd).is_sram_writer() ? "sram" : "flash"));
           // Keep diagnostics off the screen: otherwise a small header refresh
           // copies the preceding scroll region between the framebuffers.
 lvgl:
