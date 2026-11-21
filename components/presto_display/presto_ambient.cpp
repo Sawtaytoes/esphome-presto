@@ -42,10 +42,12 @@ void PrestoAmbient::send_pixels_() {
   }
   last_write_ = micros();
 }
+#ifndef PRESTO_AMBIENT_COLOR_ACCESSOR
 light::ESPColorView PrestoAmbient::get_view_internal(int32_t index) const {
   uint8_t *p = pixels_.data() + index * 3;
   return {p, p + 1, p + 2, nullptr, effect_data_.data() + index, &correction_};
 }
+#endif
 void PrestoAmbient::dump_config() {
   ESP_LOGCONFIG(TAG, "Presto rear LEDs: 7, GPIO33, PIO2");
 }
