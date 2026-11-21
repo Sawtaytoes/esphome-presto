@@ -29,6 +29,9 @@ jobs:
       fail-fast: false
       matrix:
         example: [display-test, hardware-test, castkit, lvgl, native-scene]
+        # 2026.11 changed the addressable light API that the rear LEDs implement,
+        # so build on both sides of that change.
+        esphome: ['2026.9.1', '2026.11.0']
     steps:
       - uses: actions/checkout@v7
       - name: Supply build-only example secrets
@@ -41,5 +44,5 @@ jobs:
       - name: Compile the RP2350 example
         run: >-
           docker run --rm -v "$GITHUB_WORKSPACE:/config"
-          ghcr.io/esphome/esphome:2026.9.1
+          ghcr.io/esphome/esphome:${{ matrix.esphome }}
           compile examples/${{ matrix.example }}.yaml
