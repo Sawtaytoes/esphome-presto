@@ -15,18 +15,24 @@ namespace esphome::presto_display {
 class PrestoAmbient : public light::AddressableLight {
  public:
 #ifdef PRESTO_AMBIENT_COLOR_ACCESSOR
-  PrestoAmbient() { this->accessor_ = &this->color_accessor_; }
+  PrestoAmbient() {
+    this->accessor_ = &this->color_accessor_;
+  }
 #endif
   void setup() override;
   void dump_config() override;
   void write_state(light::LightState *state) override;
-  int32_t size() const override { return 7; }
+  int32_t size() const override {
+    return 7;
+  }
   light::LightTraits get_traits() override {
     auto traits = light::LightTraits();
     traits.set_supported_color_modes({light::ColorMode::RGB});
     return traits;
   }
-  void clear_effect_data() override { effect_data_.fill(0); }
+  void clear_effect_data() override {
+    effect_data_.fill(0);
+  }
   void set_pixels(const uint8_t *rgb);
 
  protected:
@@ -38,8 +44,8 @@ class PrestoAmbient : public light::AddressableLight {
   mutable std::array<uint8_t, 7> effect_data_{};
 #ifdef PRESTO_AMBIENT_COLOR_ACCESSOR
   // Same buffer and byte order (R, G, B) as the old view; writes go through correction_.
-  light::CorrectedBufferColorAccessor color_accessor_{pixels_.data(), effect_data_.data(), {0, 1, 2},
-                                                      &this->correction_};
+  light::CorrectedBufferColorAccessor color_accessor_{
+      pixels_.data(), effect_data_.data(), {0, 1, 2}, &this->correction_};
 #endif
   PIO pio_{pio2};
   uint sm_{0};
